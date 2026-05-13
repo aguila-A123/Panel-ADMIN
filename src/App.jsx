@@ -549,7 +549,7 @@ function SidebarContent({ activeSection, sidebarOpen, setSidebarOpen, setActiveS
 }
 
 function PageHeader({ title, description, status, onOpenMobileMenu }) {
-  return <header className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 mb-6"><div className="flex items-start gap-3"><button onClick={onOpenMobileMenu} className="md:hidden h-11 w-11 rounded-2xl bg-white/10 border border-white/10 grid place-items-center shrink-0"><Icon name="menu" className="h-5 w-5" /></button><div><p className="text-cyan-300 text-sm font-semibold">[#Outlet_Stock] ➣ PANEL ADMIN</p><h2 className="text-3xl md:text-4xl font-black mt-1">{title}</h2><p className="text-slate-400 mt-2">{description}</p></div></div><button className="px-4 py-3 rounded-2xl bg-cyan-400 text-slate-950 font-bold flex items-center gap-2"><Icon name="eye" className="h-5 w-5" /> Ver catálogo</button></header>;
+  return <header className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 mb-6"><div className="flex items-start gap-3"><button onClick={onOpenMobileMenu} className="md:hidden h-11 w-11 rounded-2xl bg-white/10 border border-white/10 grid place-items-center shrink-0"><Icon name="menu" className="h-5 w-5" /></button><div><p className="text-cyan-300 text-sm font-semibold">[#Outlet_Stock] ➣ PANEL ADMIN</p><h2 className="text-3xl md:text-4xl font-black mt-1">{title}</h2><p className="text-slate-400 mt-2">{description}</p></div></div><button onClick={() => window.open("https://outletstock.app", "_blank")} className="px-4 py-3 rounded-2xl bg-cyan-400 text-slate-950 font-bold flex items-center gap-2"><Icon name="eye" className="h-5 w-5" /> Ver catálogo</button></header>;
 }
 
 function StatusBanner({ text }) {
