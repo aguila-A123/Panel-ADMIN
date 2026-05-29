@@ -220,12 +220,611 @@ function buildOrderHistory(orders) {
     .sort((a, b) => String(b.date).localeCompare(String(a.date)));
 }
 
+
+function nowTime() {
+  return new Date().toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatChatTime(value) {
+  if (!value) return nowTime();
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
+}
+
+function getProfileName(profile, fallback = "Cliente") {
+  return profile?.full_name || profile?.name || profile?.nombre || profile?.username || profile?.email?.split("@")[0] || fallback;
+}
+
+function normalizeChatMessage(message = {}) {
+  return {
+    id: message.id || `local-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    sender: message.sender || "customer",
+    type: message.type || null,
+    text: message.text || "",
+    time: message.time || nowTime(),
+    items: Array.isArray(message.items) ? message.items : undefined,
+    buttons: Array.isArray(message.buttons) ? message.buttons : undefined,
+    paymentCard: message.paymentCard || undefined,
+    customerName: message.customerName || undefined,
+    orderSignature: message.orderSignature || undefined,
+    adminConfirmed: message.adminConfirmed === true || message.confirmedByAdmin === true || message.admin_confirmed === true,
+  };
+}
+
+function chatMessageFromDb(row) {
+  const raw = row?.content ?? row?.message ?? row?.text ?? row?.body ?? row?.metadata?.json ?? row;
+  let parsed = null;
+  if (typeof raw === "string") {
+    try { parsed = JSON.parse(raw); } catch { parsed = { text: raw }; }
+  } else if (raw && typeof raw === "object") parsed = raw;
+
+  const metadata = row?.metadata && typeof row.metadata === "object" ? row.metadata : {};
+  const sender = parsed?.sender || metadata.sender || row?.sender || (row?.sender_id ? "customer" : "admin");
+  return normalizeChatMessage({
+    ...parsed,
+    id: row?.id || parsed?.id,
+    sender,
+    type: parsed?.type || metadata.type || row?.type || null,
+    text: parsed?.text || (typeof raw === "string" && raw.startsWith("{") ? "" : parsed?.text) || "",
+    time: parsed?.time || formatChatTime(row?.created_at),
+    items: parsed?.items || metadata.items,
+    buttons: parsed?.buttons || metadata.buttons,
+    paymentCard: parsed?.paymentCard || metadata.paymentCard,
+    customerName: parsed?.customerName || metadata.customerName,
+    orderSignature: parsed?.orderSignature || metadata.orderSignature,
+    adminConfirmed: parsed?.adminConfirmed === true || parsed?.confirmedByAdmin === true || parsed?.admin_confirmed === true || metadata.adminConfirmed === true || metadata.confirmedByAdmin === true || metadata.admin_confirmed === true,
+  });
+}
+
+function normalizeOrderItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((item) => ({
+    id: item.id || item.cartId || `${item.name || "producto"}-${item.size || item.selectedSize || "unica"}`,
+    name: item.name || "Producto sin nombre",
+    size: item.size || item.selectedSize || "Única",
+    qty: Math.max(1, Number(item.qty) || 1),
+    price: Number(item.price) || 0,
+    image: item.image || "",
+  })).filter((item) => item.name);
+}
+
+function chatPreview(message) {
+  if (!message) return "Sin mensajes todavía";
+  if (message.type === "order") return "Pedido enviado desde el catálogo";
+  if (message.type === "payment_confirmed" && message.adminConfirmed === true) return "Pago confirmado por OutletStock";
+  if (message.type === "payment_confirmed") return "Cliente avisó que ya pagó";
+  if (message.paymentCard) return "Datos de pago enviados";
+  if (message.buttons?.length) return "Opciones de pago enviadas";
+  return message.text || "Mensaje";
+}
+
+function isAdminPaymentConfirmation(message = {}) {
+  return message.type === "payment_confirmed" && message.sender === "admin" && message.adminConfirmed === true;
+}
+
+function isCustomerPaymentNotice(message = {}) {
+  return message.type === "payment_confirmed" && !isAdminPaymentConfirmation(message);
+}
+
+
+function buildOrderSummaries(messages = []) {
+  const orders = [];
+  let currentOrderKey = null;
+
+  function makeOrderKey(message, index) {
+    return message.orderSignature || `order-${index}-${message.id || index}`;
+  }
+
+  function getOrderByKey(key) {
+    return orders.find((order) => order.key === key) || null;
+  }
+
+  messages.forEach((message, index) => {
+    if (message.type === "order") {
+      const items = normalizeOrderItems(message.items || []);
+      if (!items.length) return;
+      const key = makeOrderKey(message, orders.length);
+      const total = items.reduce((sum, item) => sum + item.price * item.qty, 0);
+      orders.push({
+        key,
+        number: orders.length + 1,
+        messageId: message.id,
+        orderSignature: message.orderSignature || key,
+        items,
+        total,
+        time: message.time,
+        paymentMethod: "Pendiente",
+        customerPaymentReported: false,
+        adminConfirmed: false,
+      });
+      currentOrderKey = key;
+      return;
+    }
+
+    if (!orders.length) return;
+    const targetKey = message.orderSignature || currentOrderKey || orders[orders.length - 1]?.key;
+    const target = getOrderByKey(targetKey) || orders[orders.length - 1];
+    if (!target) return;
+
+    const method = message?.paymentCard?.title?.replace("Método de pago:", "").trim() || (message?.text?.match(/bizum|paypal|transferencia/i)?.[0]);
+    if (method) target.paymentMethod = method;
+
+    if (message.type === "payment_confirmed") {
+      if (message.adminConfirmed === true) target.adminConfirmed = true;
+      else target.customerPaymentReported = true;
+    }
+  });
+
+  return orders;
+}
+
+function getOrdersPackageState(orders = []) {
+  if (orders.some((order) => order.customerPaymentReported && !order.adminConfirmed)) return "pending";
+  if (orders.some((order) => order.adminConfirmed)) return "confirmed";
+  return null;
+}
+
+function getConversationUnreadState(messages = []) {
+  const last = messages[messages.length - 1];
+  return Boolean(last && last.sender !== "admin");
+}
+
+
+function buildConfirmedOrdersFromData(conversations = [], rawMessages = [], profilesById = {}) {
+  const messagesByConversation = {};
+  (rawMessages || []).forEach((row) => {
+    const cid = row.conversation_id;
+    if (!cid) return;
+    messagesByConversation[cid] = [...(messagesByConversation[cid] || []), chatMessageFromDb(row)];
+  });
+
+  return (conversations || [])
+    .flatMap((conversation) => {
+      const cid = conversation.id;
+      const customerId = conversation.customer_id || conversation.user_id;
+      const profile = profilesById[customerId] || {};
+      const customerName = getProfileName(profile, "Cliente");
+      const summaries = buildOrderSummaries(messagesByConversation[cid] || []);
+      return summaries
+        .filter((order) => order.adminConfirmed)
+        .map((order) => {
+          const images = order.items.map((item) => item.image).filter(Boolean);
+          const first = order.items[0] || {};
+          return {
+            id: `${cid}-${order.orderSignature || order.key}`,
+            conversationId: cid,
+            orderKey: order.key,
+            orderNumber: order.number,
+            customer: customerName,
+            customerId,
+            phone: profile.phone || profile.telefono || profile.phone_number || "Sin teléfono",
+            address: profile.shipping_address || profile.address || profile.direccion || "Sin dirección",
+            city: profile.city || profile.ciudad || "Sin ciudad",
+            postalCode: profile.postal_code || profile.codigo_postal || profile.zip || "Sin código postal",
+            items: order.items,
+            images,
+            image: images[0] || fallbackImage,
+            product: order.items.length === 1 ? first.name : `${order.items.length} productos`,
+            size: order.items.length === 1 ? first.size : "Varias",
+            method: order.paymentMethod || "Pendiente",
+            total: order.total,
+            price: `€ ${order.total.toFixed(2)}`,
+            createdAt: order.time || formatChatTime(conversation.created_at),
+            approvedAt: order.time || formatChatTime(conversation.created_at),
+            status: "Pagada",
+          };
+        });
+    })
+    .sort((a, b) => String(b.approvedAt || b.createdAt).localeCompare(String(a.approvedAt || a.createdAt)));
+}
+
+async function loadConfirmedOrdersFromSupabase() {
+  const { data: conversations, error: conversationsError } = await supabase
+    .from("conversations")
+    .select("*")
+    .order("created_at", { ascending: false });
+  if (conversationsError) return { data: [], error: conversationsError };
+
+  const conversationRows = Array.isArray(conversations) ? conversations : [];
+  const conversationIds = conversationRows.map((row) => row.id).filter(Boolean);
+  if (!conversationIds.length) return { data: [], error: null };
+
+  const { data: messages, error: messagesError } = await supabase
+    .from("messages")
+    .select("*")
+    .in("conversation_id", conversationIds)
+    .order("created_at", { ascending: true });
+  if (messagesError) return { data: [], error: messagesError };
+
+  const customerIds = [...new Set(conversationRows.map((row) => row.customer_id || row.user_id).filter(Boolean))];
+  let profilesById = {};
+  if (customerIds.length) {
+    const { data: profiles, error: profilesError } = await supabase
+      .from("profiles")
+      .select("*")
+      .in("id", customerIds);
+    if (profilesError) return { data: [], error: profilesError };
+    (profiles || []).forEach((profile) => { profilesById[profile.id] = profile; });
+  }
+
+  return { data: buildConfirmedOrdersFromData(conversationRows, messages || [], profilesById), error: null };
+}
+
+function ChatSupportPage() {
+  const [conversations, setConversations] = useState([]);
+  const [profilesById, setProfilesById] = useState({});
+  const [messagesByConversation, setMessagesByConversation] = useState({});
+  const [selectedConversationId, setSelectedConversationId] = useState(null);
+  const [draft, setDraft] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [warning, setWarning] = useState("");
+  const [orderPanelOpen, setOrderPanelOpen] = useState(false);
+  const [orderPanelSelectedKey, setOrderPanelSelectedKey] = useState(null);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+
+  async function loadConversations() {
+    setLoading(true);
+    const { data, error } = await supabase.from("conversations").select("*").order("created_at", { ascending: false });
+    if (error) {
+      setWarning(`No se pudieron cargar las conversaciones: ${error.message}`);
+      setLoading(false);
+      return;
+    }
+
+    const rows = Array.isArray(data) ? data : [];
+    setConversations(rows);
+    setSelectedConversationId((current) => current);
+
+    const customerIds = [...new Set(rows.map((row) => row.customer_id || row.user_id).filter(Boolean))];
+    if (customerIds.length) {
+      const profilesResult = await supabase.from("profiles").select("*").in("id", customerIds);
+      if (!profilesResult.error) {
+        const map = {};
+        (profilesResult.data || []).forEach((profile) => { map[profile.id] = profile; });
+        setProfilesById(map);
+      }
+    }
+
+    if (rows.length) await loadMessages(rows.map((row) => row.id));
+    setLoading(false);
+  }
+
+  async function loadMessages(conversationIds) {
+    const ids = Array.isArray(conversationIds) ? conversationIds.filter(Boolean) : [conversationIds].filter(Boolean);
+    if (!ids.length) return;
+    const { data, error } = await supabase.from("messages").select("*").in("conversation_id", ids).order("created_at", { ascending: true });
+    if (error) {
+      setWarning(`No se pudieron cargar los mensajes: ${error.message}`);
+      return;
+    }
+    setMessagesByConversation((current) => {
+      const next = { ...current };
+      ids.forEach((id) => { next[id] = []; });
+      (data || []).forEach((row) => {
+        const cid = row.conversation_id;
+        next[cid] = [...(next[cid] || []), chatMessageFromDb(row)];
+      });
+      return next;
+    });
+  }
+
+  useEffect(() => { loadConversations(); }, []);
+
+  useEffect(() => {
+    const channel = supabase
+      .channel("admin-chat-support-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "conversations" }, () => loadConversations())
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, (payload) => {
+        const row = payload.new;
+        setMessagesByConversation((current) => ({
+          ...current,
+          [row.conversation_id]: [...(current[row.conversation_id] || []), chatMessageFromDb(row)],
+        }));
+        setConversations((current) => current.map((conversation) => conversation.id === row.conversation_id ? { ...conversation, last_message_at: row.created_at } : conversation));
+      })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, []);
+
+  useEffect(() => {
+    function handleEsc(event) {
+      if (event.key === "Escape") {
+        if (deleteConfirmOpen) setDeleteConfirmOpen(false);
+        else if (orderPanelOpen && orderPanelSelectedKey) setOrderPanelSelectedKey(null);
+        else if (orderPanelOpen) setOrderPanelOpen(false);
+        else setSelectedConversationId(null);
+      }
+    }
+    window.addEventListener("keydown", handleEsc);
+    return () => window.removeEventListener("keydown", handleEsc);
+  }, [orderPanelOpen, orderPanelSelectedKey, deleteConfirmOpen]);
+
+  const selectedConversation = conversations.find((conversation) => conversation.id === selectedConversationId) || null;
+  const selectedMessages = selectedConversation ? messagesByConversation[selectedConversation.id] || [] : [];
+  const customerId = selectedConversation?.customer_id || selectedConversation?.user_id;
+  const customerName = getProfileName(profilesById[customerId], selectedMessages.find((message) => message.customerName)?.customerName || "Cliente");
+  const orderSummaries = buildOrderSummaries(selectedMessages);
+  const selectedOrderSummary = orderPanelSelectedKey ? orderSummaries.find((order) => order.key === orderPanelSelectedKey) || null : null;
+  const packageState = getOrdersPackageState(orderSummaries);
+
+  function getConversationPackageState(messages = []) {
+    return getOrdersPackageState(buildOrderSummaries(messages));
+  }
+
+  function closeCurrentChat() {
+    setOrderPanelOpen(false);
+    setOrderPanelSelectedKey(null);
+    setDeleteConfirmOpen(false);
+    setSelectedConversationId(null);
+  }
+
+  async function deleteCurrentConversation() {
+    if (!selectedConversation) return;
+    const conversationId = selectedConversation.id;
+    setDeleteConfirmOpen(false);
+    setOrderPanelOpen(false);
+    setOrderPanelSelectedKey(null);
+
+    const { data, error } = await supabase
+      .from("conversations")
+      .delete()
+      .eq("id", conversationId)
+      .select("id");
+
+    if (error) {
+      setWarning(`No se pudo cerrar el chat: ${error.message}`);
+      return;
+    }
+
+    if (!Array.isArray(data) || data.length === 0) {
+      setWarning("No se pudo cerrar el chat. Revisa que el panel tenga permiso para cerrar conversaciones.");
+      await loadConversations();
+      return;
+    }
+
+    setSelectedConversationId(null);
+    setMessagesByConversation((current) => {
+      const next = { ...current };
+      delete next[conversationId];
+      return next;
+    });
+    setConversations((current) => current.filter((conversation) => conversation.id !== conversationId));
+  }
+
+  async function confirmPaymentFromAdmin(orderToConfirm) {
+    if (!selectedConversation || !orderToConfirm || orderToConfirm.adminConfirmed) return;
+    const message = normalizeChatMessage({
+      sender: "admin",
+      type: "payment_confirmed",
+      adminConfirmed: true,
+      text: `Pago confirmado por OutletStock para el Pedido Nº ${orderToConfirm.number}.`,
+      orderSignature: orderToConfirm.orderSignature || orderToConfirm.key,
+      orderNumber: orderToConfirm.number,
+      time: nowTime(),
+    });
+    const { error } = await supabase.from("messages").insert({
+      conversation_id: selectedConversation.id,
+      sender_id: customerId,
+      body: JSON.stringify(message),
+    });
+    if (error) setWarning(`No se pudo confirmar el pago: ${error.message}`);
+    else setOrderPanelSelectedKey(null);
+  }
+
+  async function sendAdminMessage() {
+    const clean = draft.trim();
+    if (!clean || !selectedConversation) return;
+    setDraft("");
+    const message = normalizeChatMessage({ sender: "admin", text: clean, time: nowTime() });
+    const { error } = await supabase.from("messages").insert({
+      conversation_id: selectedConversation.id,
+      sender_id: customerId,
+      body: JSON.stringify(message),
+    });
+    if (error) setWarning(`No se pudo enviar el mensaje: ${error.message}`);
+  }
+
+  return (
+    <section className="h-screen min-h-0 overflow-hidden border-l border-cyan-500/10 bg-[#020817]/70 shadow-2xl shadow-cyan-500/10">
+      <div className="grid h-full grid-cols-1 md:grid-cols-[340px_1fr]">
+        <aside className="min-h-0 border-r border-cyan-500/10 bg-[#050b16]/80">
+          <div className="border-b border-cyan-500/10 p-4">
+            <div className="flex items-center gap-3">
+              <div className="grid h-11 w-11 place-items-center rounded-2xl bg-cyan-400 text-[#020817]"><Icon name="chat" /></div>
+              <div><h2 className="font-black">Chat soporte</h2><p className="text-xs text-cyan-100/70">Conversaciones del catálogo</p></div>
+            </div>
+          </div>
+          <div className="chat-scroll h-[calc(100%-78px)] overflow-y-auto p-2">
+            {loading ? <p className="p-4 text-sm text-slate-400">Cargando conversaciones...</p> : conversations.length === 0 ? <p className="p-4 text-sm text-slate-400">Aún no hay clientes escribiendo.</p> : conversations.map((conversation) => {
+              const cid = conversation.id;
+              const clientId = conversation.customer_id || conversation.user_id;
+              const msgs = messagesByConversation[cid] || [];
+              const last = msgs[msgs.length - 1];
+              const name = getProfileName(profilesById[clientId], msgs.find((message) => message.customerName)?.customerName || "Cliente");
+              const listPackageState = getConversationPackageState(msgs);
+              return <button key={cid} onClick={() => setSelectedConversationId(cid)} className={`${selectedConversationId === cid ? "border-cyan-400/40 bg-cyan-400/10" : "border-transparent hover:bg-white/[0.04]"} mb-2 w-full rounded-2xl border p-3 text-left transition`}>
+                <div className="flex items-center gap-3">
+                  <div className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-gradient-to-br from-cyan-400/30 to-blue-500/20 text-sm font-black text-cyan-100">{name.slice(0, 1).toUpperCase()}</div>
+                  <div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-2"><div className="flex min-w-0 items-center gap-2"><p className="truncate text-sm font-black text-white">{name}</p>{listPackageState && <PackageStatusIcon state={listPackageState} size="sm" />}</div><span className="text-[10px] text-cyan-100/55">{last?.time || formatChatTime(conversation.created_at)}</span></div><p className="truncate text-xs text-slate-400">{chatPreview(last)}</p></div>
+                </div>
+              </button>;
+            })}
+          </div>
+        </aside>
+
+        <main className="relative flex min-h-0 flex-col bg-[radial-gradient(circle_at_top_left,rgba(0,224,255,0.10),transparent_35%),linear-gradient(135deg,#020817,#031525,#020617)]">
+          {selectedConversation ? <>
+            <header className="border-b border-cyan-500/10 bg-[#020817]/90 p-4 backdrop-blur-xl">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-3">
+                  <div className="relative grid h-12 w-12 place-items-center rounded-2xl border border-cyan-400/20 bg-[#050b16]"><span className="font-black text-cyan-100">{customerName.slice(0,1).toUpperCase()}</span><span className="absolute bottom-0 right-0 h-3.5 w-3.5 rounded-full bg-cyan-400 ring-2 ring-[#020817]" /></div>
+                  <div className="min-w-0"><div className="flex min-w-0 items-center gap-2"><p className="truncate font-black">{customerName}</p>{packageState && <PackageStatusIcon state={packageState} />}</div><p className="truncate text-xs text-cyan-200/80">En línea · responde como OutletStock</p></div>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <button onClick={() => { setOrderPanelOpen(true); setOrderPanelSelectedKey(null); }} title="Ver pedidos" className="grid h-11 w-11 place-items-center rounded-2xl border border-cyan-400/25 bg-cyan-400/10 text-cyan-100 transition hover:bg-cyan-400/20"><Icon name="receipt" /></button>
+                  <button onClick={() => setDeleteConfirmOpen(true)} title="Cerrar/eliminar chat" className="grid h-11 w-11 place-items-center rounded-2xl border border-red-400/25 bg-red-400/10 text-red-100 transition hover:bg-red-400/20"><Icon name="trash" /></button>
+                  <button onClick={closeCurrentChat} title="Cerrar chat" className="grid h-11 w-11 place-items-center rounded-2xl border border-white/10 bg-white/5 text-cyan-100 transition hover:bg-white/10"><Icon name="close" /></button>
+                </div>
+              </div>
+            </header>
+            <div className="chat-scroll min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-5">
+              <div className="mx-auto mb-4 flex w-fit items-center gap-2 rounded-full border border-cyan-500/10 bg-cyan-400/10 px-4 py-2 text-xs font-bold text-cyan-100">Chat seguro con Outlet Stock</div>
+              {warning && <div className="mx-auto max-w-xl rounded-2xl border border-yellow-300/20 bg-yellow-300/10 p-3 text-xs text-yellow-100">{warning}</div>}
+              {selectedMessages.map((message, index) => <AdminMessageBubble key={message.id || index} message={message} customerName={customerName} />)}
+            </div>
+            {orderPanelOpen && <OrderSummaryPanel customerName={customerName} orders={orderSummaries} selectedOrder={selectedOrderSummary} selectedOrderKey={orderPanelSelectedKey} onSelectOrder={setOrderPanelSelectedKey} onBack={() => setOrderPanelSelectedKey(null)} onClose={() => { setOrderPanelOpen(false); setOrderPanelSelectedKey(null); }} onConfirm={confirmPaymentFromAdmin} />}
+            {deleteConfirmOpen && <DeleteConversationConfirm customerName={customerName} onCancel={() => setDeleteConfirmOpen(false)} onConfirm={deleteCurrentConversation} />}
+            <footer className="border-t border-cyan-500/10 bg-[#020817]/90 p-3 backdrop-blur-xl">
+              <div className="flex items-end gap-3 rounded-3xl border border-cyan-500/10 bg-[#081320] p-2 shadow-xl shadow-cyan-500/10">
+                <textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendAdminMessage(); } }} rows={1} placeholder="Escribe como OutletStock..." className="max-h-28 min-h-11 flex-1 resize-none bg-transparent px-1 py-3 text-sm text-white outline-none placeholder:text-zinc-500" />
+                <button onClick={sendAdminMessage} className="grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-cyan-400 text-[#020817] shadow-lg shadow-cyan-500/20 transition active:scale-95"><Icon name="send" /></button>
+              </div>
+            </footer>
+          </> : <div className="grid h-full place-items-center p-6 text-center text-slate-400">Dale click a un chat para abrirlo.</div>}
+        </main>
+      </div>
+      <style>{`.chat-scroll{scrollbar-width:none;-ms-overflow-style:none}.chat-scroll::-webkit-scrollbar{display:none}`}</style>
+    </section>
+  );
+}
+
+function DeleteConversationConfirm({ customerName, onCancel, onConfirm }) {
+  return (
+    <div className="absolute inset-0 z-30 grid place-items-center bg-black/65 p-4 backdrop-blur-sm">
+      <motion.div initial={{ opacity: 0, scale: 0.94, y: 12 }} animate={{ opacity: 1, scale: 1, y: 0 }} className="w-full max-w-sm rounded-3xl border border-red-400/25 bg-[#061223] p-5 text-center shadow-2xl shadow-red-500/20">
+        <div className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-2xl border border-red-300/30 bg-red-400/10 text-red-100"><Icon name="trash" /></div>
+        <h4 className="text-lg font-black text-white">Cerrar chat</h4>
+        <p className="mt-2 text-sm leading-relaxed text-cyan-100/75">¿De verdad deseas cerrar y eliminar el chat de <span className="font-black text-cyan-100">{customerName}</span>? Esta acción cerrará la conversación y ya no aparecerá en el panel.</p>
+        <div className="mt-5 grid grid-cols-2 gap-3">
+          <button onClick={onCancel} className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-black text-cyan-100 transition hover:bg-white/10">No</button>
+          <button onClick={onConfirm} className="rounded-2xl bg-red-400 px-4 py-3 text-sm font-black text-[#020817] shadow-lg shadow-red-500/20 transition active:scale-95">Sí, cerrar</button>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
+function PackageStatusIcon({ state, size = "md" }) {
+  const pending = state === "pending";
+  const boxSize = size === "sm" ? "h-6 w-6" : "h-8 w-8";
+  const iconSize = size === "sm" ? "h-3.5 w-3.5" : "h-4.5 w-4.5";
+  return (
+    <span title={pending ? "Pago por confirmar" : "Pago confirmado"} className={`${boxSize} grid shrink-0 place-items-center rounded-xl border ${pending ? "border-emerald-300/60 bg-emerald-400/20 text-emerald-200 shadow-[0_0_18px_rgba(52,211,153,.75)]" : "border-amber-300/45 bg-amber-500/15 text-amber-200 shadow-[0_0_12px_rgba(251,191,36,.25)]"}`}>
+      <Icon name={pending ? "bagGlow" : "boxDone"} className={iconSize} />
+    </span>
+  );
+}
+
+function OrderSummaryPanel({ customerName, orders = [], selectedOrder, selectedOrderKey, onSelectOrder, onBack, onClose, onConfirm }) {
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const singleOrder = orders.length === 1 ? orders[0] : null;
+  const displayOrder = selectedOrder || singleOrder;
+  const showingDetail = Boolean(displayOrder);
+  const canGoBackToList = Boolean(selectedOrderKey && selectedOrder && orders.length > 1);
+
+  function handleConfirmClick() {
+    if (!displayOrder || displayOrder.adminConfirmed || !displayOrder.items.length) return;
+    setConfirmOpen(true);
+  }
+
+  function handleConfirmYes() {
+    setConfirmOpen(false);
+    onConfirm(displayOrder);
+  }
+
+  return (
+    <div className="absolute inset-y-0 right-0 z-20 flex w-full justify-end bg-[#020817]/45 backdrop-blur-sm">
+      <motion.aside initial={{ x: 80, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: 80, opacity: 0 }} className="chat-scroll h-full w-full max-w-md overflow-y-auto border-l border-cyan-400/20 bg-[#04101f] p-4 shadow-2xl shadow-cyan-500/20">
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-black uppercase tracking-[0.24em] text-cyan-300">Resumen de pedido</p>
+            <h3 className="mt-1 text-2xl font-black text-white">{showingDetail ? `Pedido Nº ${displayOrder.number}` : customerName}</h3>
+          </div>
+          <button onClick={canGoBackToList ? onBack : onClose} title={canGoBackToList ? "Volver" : "Cerrar"} className="grid h-10 w-10 place-items-center rounded-2xl border border-white/10 bg-white/5 text-cyan-100 transition hover:bg-white/10"><Icon name="close" /></button>
+        </div>
+
+        {!orders.length ? (
+          <div className="rounded-3xl border border-yellow-300/20 bg-yellow-300/10 p-4 text-sm text-yellow-100">Este chat todavía no tiene un pedido detectado.</div>
+        ) : !showingDetail ? (
+          <div className="space-y-3">
+            <p className="text-sm text-cyan-100/70">Selecciona un pedido para ver el detalle.</p>
+            {orders.map((order) => {
+              const state = order.customerPaymentReported && !order.adminConfirmed ? "pending" : order.adminConfirmed ? "confirmed" : null;
+              return (
+                <button key={order.key} onClick={() => onSelectOrder(order.key)} className="flex w-full items-center justify-between gap-3 rounded-3xl border border-cyan-400/15 bg-[#020817]/70 p-4 text-left transition hover:border-cyan-300/40 hover:bg-cyan-400/10">
+                  <div className="min-w-0">
+                    <p className="font-black text-white">Pedido Nº {order.number}</p>
+                    <p className="mt-1 text-xs text-cyan-100/60">{order.items.length} producto{order.items.length === 1 ? "" : "s"} · {order.paymentMethod}</p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-3">
+                    <span className="font-black text-cyan-100">€ {order.total.toFixed(2)}</span>
+                    {state ? <PackageStatusIcon state={state} /> : <span className="h-8 w-8 rounded-xl border border-white/10 bg-white/5" />}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <>
+            <div className="space-y-3">
+              {displayOrder.items.map((item) => <div key={`${item.id}-${item.size}`} className="flex gap-3 rounded-3xl border border-cyan-400/15 bg-[#020817]/70 p-3">
+                <div className="grid h-16 w-16 shrink-0 place-items-center overflow-hidden rounded-2xl bg-cyan-950/60">{item.image ? <img src={item.image} alt={item.name} className="h-full w-full object-cover" /> : <span className="text-xs font-black text-cyan-100">OS</span>}</div>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-black text-white">{item.name}</p>
+                  <p className="mt-1 text-xs text-cyan-100/70">Talla {item.size} · Cant. {item.qty}</p>
+                  <p className="mt-2 text-sm font-black text-cyan-100">€ {(item.price * item.qty).toFixed(2)}</p>
+                </div>
+              </div>)}
+              <div className="rounded-3xl border border-cyan-400/15 bg-cyan-400/10 p-4">
+                <div className="flex justify-between text-lg font-black"><span>Total</span><span>€ {displayOrder.total.toFixed(2)}</span></div>
+              </div>
+            </div>
+
+            <div className="mt-4 grid gap-3 rounded-3xl border border-cyan-400/15 bg-[#020817]/70 p-4">
+              <div className="flex items-center justify-between gap-3"><span className="text-sm text-cyan-100/70">Método de pago</span><span className="rounded-full bg-cyan-400/10 px-3 py-1 text-sm font-black text-cyan-100">{displayOrder.paymentMethod}</span></div>
+              <div className="flex items-center justify-between gap-3"><span className="text-sm text-cyan-100/70">Estado</span><span className={`rounded-full px-3 py-1 text-sm font-black ${displayOrder.adminConfirmed || displayOrder.customerPaymentReported ? "bg-emerald-400/15 text-emerald-200" : "bg-yellow-300/10 text-yellow-100"}`}>{displayOrder.adminConfirmed || displayOrder.customerPaymentReported ? "Pagado" : "Pendiente"}</span></div>
+            </div>
+
+            <button onClick={handleConfirmClick} disabled={displayOrder.adminConfirmed || !displayOrder.items.length} className="mt-4 w-full rounded-3xl bg-cyan-400 px-5 py-4 text-sm font-black text-[#020817] shadow-lg shadow-cyan-500/20 transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-50">{displayOrder.adminConfirmed ? "Pago confirmado" : "Pago ya confirmado"}</button>
+          </>
+        )}
+
+        {confirmOpen && displayOrder && (
+          <div className="fixed inset-0 z-40 grid place-items-center bg-black/65 p-4 backdrop-blur-sm">
+            <motion.div initial={{ opacity: 0, scale: 0.94, y: 12 }} animate={{ opacity: 1, scale: 1, y: 0 }} className="w-full max-w-sm rounded-3xl border border-cyan-400/20 bg-[#061223] p-5 text-center shadow-2xl shadow-cyan-500/20">
+              <div className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-2xl border border-yellow-300/30 bg-yellow-300/10 text-yellow-100"><Icon name="receipt" /></div>
+              <h4 className="text-lg font-black text-white">Confirmar pago</h4>
+              <p className="mt-2 text-sm leading-relaxed text-cyan-100/75">¿Está seguro que recibió el dinero del <span className="font-black text-cyan-100">Pedido Nº {displayOrder.number}</span> en el método de pago: <span className="font-black text-cyan-100">{displayOrder.paymentMethod}</span>?</p>
+              <div className="mt-5 grid grid-cols-2 gap-3">
+                <button onClick={() => setConfirmOpen(false)} className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-black text-cyan-100 transition hover:bg-white/10">No</button>
+                <button onClick={handleConfirmYes} className="rounded-2xl bg-cyan-400 px-4 py-3 text-sm font-black text-[#020817] shadow-lg shadow-cyan-500/20 transition active:scale-95">Sí</button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </motion.aside>
+    </div>
+  );
+}
+
+function AdminMessageBubble({ message, customerName }) {
+  const mine = message.sender === "admin";
+  if (message.type === "order") {
+    const items = normalizeOrderItems(message.items || []);
+    const total = items.reduce((sum, item) => sum + item.price * item.qty, 0);
+    return <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="flex justify-start"><div className="w-full max-w-[88%] rounded-3xl rounded-bl-md border border-cyan-400/30 bg-cyan-400/15 p-3 text-white shadow-lg shadow-cyan-500/10 md:max-w-[72%]"><p className="mb-3 text-sm font-black">Pedido enviado por {customerName}</p>{items.map((item) => <div key={`${item.id}-${item.size}`} className="mb-2 flex gap-3 rounded-2xl bg-[#020817]/45 p-2"><div className="grid h-12 w-12 place-items-center overflow-hidden rounded-xl bg-cyan-950/60">{item.image ? <img src={item.image} alt={item.name} className="h-full w-full object-cover" /> : <span className="text-[8px] font-black">OS</span>}</div><div className="min-w-0 flex-1"><p className="truncate text-xs font-bold">{item.name}</p><p className="text-[11px] text-cyan-100/75">Talla {item.size} · Cant. {item.qty}</p></div><p className="text-xs font-black">€ {(item.price * item.qty).toFixed(2)}</p></div>)}<div className="mt-3 flex justify-between rounded-2xl bg-[#020817]/60 p-3 text-sm font-black"><span>Total</span><span>€ {total.toFixed(2)}</span></div><p className="mt-2 text-right text-[10px] text-cyan-100/70">{message.time}</p></div></motion.div>;
+  }
+  if (message.type === "payment_confirmed") return <div className={`mx-auto w-fit rounded-2xl border px-4 py-3 text-sm font-black ${message.adminConfirmed === true ? "border-cyan-400/20 bg-cyan-400/10 text-cyan-100" : "border-emerald-300/25 bg-emerald-400/10 text-emerald-100"}`}>{message.adminConfirmed === true ? "Pago confirmado por OutletStock" : `${customerName} avisó que ya pagó`} · {message.time}</div>;
+  return <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className={`flex ${mine ? "justify-end" : "justify-start"}`}><div className={`${mine ? "rounded-br-md border-cyan-400/30 bg-cyan-400/15 text-white shadow-cyan-500/10" : "rounded-bl-md border-white/10 bg-[#0b1727] text-zinc-100 shadow-black/20"} max-w-[82%] rounded-3xl border px-4 py-3 shadow-lg`}><p className="mb-1 text-[11px] font-black text-cyan-100/70">{mine ? "OutletStock" : customerName}</p>{message.text && <p className="whitespace-pre-wrap text-sm leading-relaxed">{message.text}</p>}{message.paymentCard && <div className="mt-3 rounded-2xl border border-cyan-400/20 bg-[#020817]/70 p-3 text-xs text-cyan-100">Datos de pago enviados</div>}{message.buttons?.length ? <div className="mt-3 flex flex-wrap gap-2">{message.buttons.map((button) => <span key={button} className="rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-3 py-2 text-xs font-black text-cyan-100">{button}</span>)}</div> : null}<p className={`mt-2 text-[10px] ${mine ? "text-right text-cyan-100/80" : "text-zinc-400"}`}>{message.time}</p></div></motion.div>;
+}
+
 export default function AdminCatalogPanel() {
   const [activeSection, setActiveSection] = useState("dashboard");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [products, setProducts] = useState([]);
-  const [orders] = useState([]);
+  const [orders, setOrders] = useState([]);
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [viewingOrder, setViewingOrder] = useState(null);
   const [productSearch, setProductSearch] = useState("");
@@ -267,6 +866,31 @@ export default function AdminCatalogPanel() {
       .on("postgres_changes", { event: "*", schema: "public", table: SIZE_TABLE }, () => setReloadKey((value) => value + 1))
       .subscribe();
     return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    async function loadConfirmedOrders() {
+      const result = await loadConfirmedOrdersFromSupabase();
+      if (!mounted) return;
+      if (result.error) {
+        console.warn("Confirmed orders error:", result.error);
+        setOrders([]);
+        return;
+      }
+      setOrders(result.data || []);
+    }
+    loadConfirmedOrders();
+    const channel = supabase
+      .channel("confirmed-orders-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, loadConfirmedOrders)
+      .on("postgres_changes", { event: "*", schema: "public", table: "conversations" }, loadConfirmedOrders)
+      .on("postgres_changes", { event: "*", schema: "public", table: "profiles" }, loadConfirmedOrders)
+      .subscribe();
+    return () => {
+      mounted = false;
       supabase.removeChannel(channel);
     };
   }, []);
@@ -469,8 +1093,8 @@ export default function AdminCatalogPanel() {
     if (section === "history") setHistorySearch("");
   }
 
-  const pageTitle = activeSection === "products" ? "Productos" : activeSection === "orders" ? "Pedidos" : activeSection === "history" ? "Historial" : activeSection === "payments" ? "Pagos" : "Gestión del catálogo";
-  const pageDescription = activeSection === "products" ? "Revisa, busca y edita todos los productos publicados." : activeSection === "orders" ? "Revisa las ventas realizadas y abre el detalle de cada compra." : activeSection === "history" ? "Consulta el historial de compras con fecha, hora, cliente y producto." : activeSection === "payments" ? "Revisa el total ganado y el desglose por método de pago." : "Sube productos, revisa compras y administra tu catálogo desde una sola vista.";
+  const pageTitle = activeSection === "products" ? "Productos" : activeSection === "orders" ? "Pedidos" : activeSection === "history" ? "Historial" : activeSection === "payments" ? "Pagos" : activeSection === "chat" ? "Chat soporte" : "Gestión del catálogo";
+  const pageDescription = activeSection === "products" ? "Revisa, busca y edita todos los productos publicados." : activeSection === "orders" ? "Revisa las ventas realizadas y abre el detalle de cada compra." : activeSection === "history" ? "Consulta el historial de compras con fecha, hora, cliente y producto." : activeSection === "payments" ? "Revisa el total ganado y el desglose por método de pago." : activeSection === "chat" ? "Responde a tus clientes en tiempo real como OutletStock." : "Sube productos, revisa compras y administra tu catálogo desde una sola vista.";
 
   const navProps = {
     activeSection,
@@ -481,6 +1105,7 @@ export default function AdminCatalogPanel() {
     goToOrders: () => goTo("orders"),
     goToPayments: () => goTo("payments"),
     goToHistory: () => goTo("history"),
+    goToChat: () => goTo("chat"),
   };
 
   return (
@@ -497,8 +1122,8 @@ export default function AdminCatalogPanel() {
           </div>
         )}
 
-        <main className="flex-1 p-4 md:p-7 overflow-y-auto max-h-screen pb-24 md:pb-7">
-          <PageHeader title={pageTitle} description={pageDescription} status={supabaseStatus} onOpenMobileMenu={() => setMobileMenuOpen(true)} />
+        <main className={activeSection === "chat" ? "flex-1 overflow-hidden max-h-screen" : "flex-1 p-4 md:p-7 overflow-y-auto max-h-screen pb-24 md:pb-7"}>
+          {activeSection !== "chat" && <PageHeader title={pageTitle} description={pageDescription} status={supabaseStatus} onOpenMobileMenu={() => setMobileMenuOpen(true)} />}
           
 
           {activeSection === "products" ? (
@@ -509,6 +1134,8 @@ export default function AdminCatalogPanel() {
             <HistoryPage orderHistory={orderHistory} historySearch={historySearch} setHistorySearch={setHistorySearch} />
           ) : activeSection === "payments" ? (
             <PaymentsPage orders={orders} totalSales={totalSales} paymentStats={paymentStats} />
+          ) : activeSection === "chat" ? (
+            <ChatSupportPage />
           ) : (
             <DashboardPage products={products} orders={orders} totalSales={totalSales} productSearch={productSearch} setProductSearch={setProductSearch} filteredProducts={filteredProducts} visibleProducts={visibleProducts} form={form} setForm={setForm} errors={errors} addProduct={addProduct} handleImageUpload={handleImageUpload} removeSelectedImage={removeSelectedImage} deleteProduct={deleteProduct} openEditForm={openEditForm} orderSearch={orderSearch} setOrderSearch={setOrderSearch} filteredOrders={filteredOrders} visibleOrders={visibleOrders} selectedOrder={selectedOrder} openOrderDetail={(order) => { setSelectedOrder(order); setViewingOrder(order); }} goToProducts={() => goTo("products")} goToOrders={() => goTo("orders")} />
           )}
@@ -526,7 +1153,53 @@ function Sidebar(props) {
   return <aside className={`${props.sidebarOpen ? "w-72" : "w-20"} hidden md:flex transition-all duration-300 border-r border-white/10 bg-black/25 backdrop-blur-xl flex-col p-4`}><SidebarContent {...props} /></aside>;
 }
 
-function SidebarContent({ activeSection, sidebarOpen, setSidebarOpen, setActiveSection, goToProducts, goToOrders, goToPayments, goToHistory }) {
+
+function ChatNavIndicators({ collapsed = false }) {
+  const [unreadChats, setUnreadChats] = useState(0);
+  const [hasPendingPayment, setHasPendingPayment] = useState(false);
+
+  async function refreshIndicators() {
+    const { data: conversationsData } = await supabase.from("conversations").select("id");
+    const conversationIds = (conversationsData || []).map((row) => row.id).filter(Boolean);
+    if (!conversationIds.length) {
+      setUnreadChats(0);
+      setHasPendingPayment(false);
+      return;
+    }
+
+    const { data: messageRows } = await supabase.from("messages").select("*").in("conversation_id", conversationIds).order("created_at", { ascending: true });
+    const grouped = {};
+    (messageRows || []).forEach((row) => {
+      const cid = row.conversation_id;
+      grouped[cid] = [...(grouped[cid] || []), chatMessageFromDb(row)];
+    });
+
+    const unread = Object.values(grouped).filter((messages) => getConversationUnreadState(messages)).length;
+    const pending = Object.values(grouped).some((messages) => getOrdersPackageState(buildOrderSummaries(messages)) === "pending");
+    setUnreadChats(unread);
+    setHasPendingPayment(pending);
+  }
+
+  useEffect(() => {
+    refreshIndicators();
+    const channel = supabase
+      .channel("admin-chat-nav-indicators")
+      .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, refreshIndicators)
+      .on("postgres_changes", { event: "*", schema: "public", table: "conversations" }, refreshIndicators)
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, []);
+
+  if (!unreadChats && !hasPendingPayment) return null;
+  return (
+    <span className={`${collapsed ? "absolute -right-1 -top-1" : "ml-auto"} flex items-center gap-1`}>
+      {hasPendingPayment && <span title="Pagos por revisar" className="grid h-6 w-6 animate-pulse place-items-center rounded-xl border border-emerald-300/60 bg-emerald-400/20 text-emerald-200 shadow-[0_0_16px_rgba(52,211,153,.8)]"><Icon name="bagGlow" className="h-3.5 w-3.5" /></span>}
+      {unreadChats > 0 && <span title={`${unreadChats} chat(s) con mensaje nuevo`} className="grid h-5 min-w-5 place-items-center rounded-full bg-cyan-400 px-1.5 text-[10px] font-black text-[#020817] shadow-lg shadow-cyan-500/30">{unreadChats}</span>}
+    </span>
+  );
+}
+
+function SidebarContent({ activeSection, sidebarOpen, setSidebarOpen, setActiveSection, goToProducts, goToOrders, goToPayments, goToHistory, goToChat }) {
   return (
     <>
       <div className="flex items-center justify-between gap-3 mb-8">
@@ -540,7 +1213,7 @@ function SidebarContent({ activeSection, sidebarOpen, setSidebarOpen, setActiveS
         <NavButton icon="home" label="Inicio" active={activeSection === "dashboard"} collapsed={!sidebarOpen} onClick={() => setActiveSection("dashboard")} />
         <NavButton icon="package" label="Productos" active={activeSection === "products"} collapsed={!sidebarOpen} onClick={goToProducts} />
         <NavButton icon="bag" label="Pedidos" active={activeSection === "orders"} collapsed={!sidebarOpen} onClick={goToOrders} />
-        <NavButton icon="chat" label="Chat soporte" collapsed={!sidebarOpen} />
+        <NavButton icon="chat" label="Chat soporte" active={activeSection === "chat"} collapsed={!sidebarOpen} onClick={goToChat} extra={<ChatNavIndicators collapsed={!sidebarOpen} />} />
         <NavButton icon="card" label="Pagos" active={activeSection === "payments"} collapsed={!sidebarOpen} onClick={goToPayments} />
         <NavButton icon="clock" label="Historial" active={activeSection === "history"} collapsed={!sidebarOpen} onClick={goToHistory} />
       </nav>
@@ -572,7 +1245,7 @@ function DashboardPage(props) {
         </motion.div>
         <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }} className="xl:col-span-2 rounded-3xl bg-white/[0.06] border border-white/10 p-4 md:p-5 shadow-2xl"><div className="flex flex-col gap-4 mb-5"><div className="flex items-start justify-between gap-3"><div><h3 className="text-xl font-black">Productos publicados ({products.length})</h3><p className="text-sm text-slate-400">Vista compacta responsive.</p></div><button onClick={goToProducts} className="px-3 py-2 rounded-xl bg-cyan-400/10 text-cyan-300 border border-cyan-300/20 text-xs font-bold">Ver todos</button></div><SearchBox value={productSearch} onChange={setProductSearch} placeholder="Buscar producto..." /></div>{filteredProducts.length === 0 ? <EmptyBox text="No hay productos cargados desde Supabase o no coinciden con esa búsqueda." /> : <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-2 gap-3">{visibleProducts.map((product) => <ProductCard key={product.id} product={product} onDelete={deleteProduct} onEdit={openEditForm} />)}</div>}</motion.div>
       </section>
-      <section className="grid grid-cols-1 xl:grid-cols-3 gap-5 mt-5 pb-8"><div className="xl:col-span-2 rounded-3xl bg-white/[0.06] border border-white/10 p-5"><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4"><div><h3 className="text-xl font-black">Compras recibidas ({orders.length})</h3><p className="text-sm text-slate-400">Aún no está conectado a tabla de pedidos.</p></div><SearchBox value={orderSearch} onChange={setOrderSearch} placeholder="Buscar pedido..." compact /></div>{filteredOrders.length === 0 ? <EmptyBox text="Todavía no hay pedidos conectados." /> : <div className="grid grid-cols-2 md:grid-cols-3 gap-3">{visibleOrders.map((order) => <OrderCard key={order.id} order={order} isSelected={selectedOrder?.id === order.id} onClick={() => openOrderDetail(order)} />)}</div>}</div><div className="rounded-3xl bg-white/[0.06] border border-white/10 p-5"><h3 className="text-xl font-black mb-4">Acciones rápidas</h3><div className="space-y-3"><button onClick={goToProducts} className="w-full py-3 rounded-2xl bg-cyan-400/10 text-cyan-300 border border-cyan-300/20 font-bold">Ver productos</button><button onClick={goToOrders} className="w-full py-3 rounded-2xl bg-white/10 font-bold hover:bg-white/15 transition">Revisar pedidos</button></div></div></section>
+      <section className="grid grid-cols-1 xl:grid-cols-3 gap-5 mt-5 pb-8"><div className="xl:col-span-2 rounded-3xl bg-white/[0.06] border border-white/10 p-5"><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4"><div><h3 className="text-xl font-black">Compras recibidas ({orders.length})</h3><p className="text-sm text-slate-400">Pedidos confirmados por el admin desde el chat.</p></div><SearchBox value={orderSearch} onChange={setOrderSearch} placeholder="Buscar pedido..." compact /></div>{filteredOrders.length === 0 ? <EmptyBox text="Aún no hay pedidos pagados confirmados." /> : <div className="grid grid-cols-2 md:grid-cols-3 gap-3">{visibleOrders.map((order) => <OrderCard key={order.id} order={order} isSelected={selectedOrder?.id === order.id} onClick={() => openOrderDetail(order)} />)}</div>}</div><div className="rounded-3xl bg-white/[0.06] border border-white/10 p-5"><h3 className="text-xl font-black mb-4">Acciones rápidas</h3><div className="space-y-3"><button onClick={goToProducts} className="w-full py-3 rounded-2xl bg-cyan-400/10 text-cyan-300 border border-cyan-300/20 font-bold">Ver productos</button><button onClick={goToOrders} className="w-full py-3 rounded-2xl bg-white/10 font-bold hover:bg-white/15 transition">Revisar pedidos</button></div></div></section>
     </>
   );
 }
@@ -606,9 +1279,9 @@ function OrdersPage({ approvedOrders, selectedOrder, openOrderDetail }) {
   const [search, setSearch] = useState("");
   const filtered = useMemo(() => {
     const query = normalizeText(search);
-    return approvedOrders.filter((order) => normalizeText(`${order.id} ${order.customer} ${order.address} ${order.method} ${order.price} ${order.size}`).includes(query));
+    return approvedOrders.filter((order) => normalizeText(`${order.id} ${order.customer} ${order.phone} ${order.address} ${order.city} ${order.postalCode} ${order.method} ${order.price} ${order.items?.map((item) => `${item.name} ${item.size}`).join(" ")}`).includes(query));
   }, [approvedOrders, search]);
-  return <section className="pb-8"><motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="rounded-3xl bg-white/[0.06] border border-white/10 p-5 shadow-2xl"><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4"><div><h3 className="text-xl font-black">Ventas realizadas ({approvedOrders.length})</h3><p className="text-sm text-slate-400">Pendiente conectar tabla de pedidos.</p></div><div className="flex items-center gap-3"><SearchBox value={search} onChange={setSearch} placeholder="Buscar pedido..." compact /><span className="px-3 py-1 rounded-full bg-emerald-400/10 text-emerald-300 border border-emerald-300/20 text-xs font-bold">Pagadas</span></div></div>{filtered.length === 0 ? <EmptyBox text="No hay ventas conectadas todavía." /> : <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">{filtered.map((order) => <OrderCard key={order.id} order={order} isSelected={selectedOrder?.id === order.id} onClick={() => openOrderDetail(order)} />)}</div>}</motion.div></section>;
+  return <section className="pb-8"><motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="rounded-3xl bg-white/[0.06] border border-white/10 p-5 shadow-2xl"><div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4"><div><h3 className="text-xl font-black">Pedidos pagados ({approvedOrders.length})</h3><p className="text-sm text-slate-400">Pedidos confirmados por el admin desde el chat.</p></div><div className="flex items-center gap-3"><SearchBox value={search} onChange={setSearch} placeholder="Buscar pedido..." compact /><span className="px-3 py-1 rounded-full bg-emerald-400/10 text-emerald-300 border border-emerald-300/20 text-xs font-bold">Pagadas</span></div></div>{filtered.length === 0 ? <EmptyBox text="Aún no hay pedidos pagados confirmados." /> : <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">{filtered.map((order) => <OrderCard key={order.id} order={order} isSelected={selectedOrder?.id === order.id} onClick={() => openOrderDetail(order)} />)}</div>}</motion.div></section>;
 }
 
 function PaymentsPage({ orders, totalSales, paymentStats }) {
@@ -641,7 +1314,8 @@ function ProductsPage({ products, filteredProducts, productSearch, setProductSea
 }
 
 function OrderDetailModal({ order, onClose }) {
-  return <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"><motion.div initial={{ opacity: 0, scale: 0.95, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} className="w-full max-w-3xl rounded-3xl bg-[#071120]/95 border border-white/10 shadow-2xl overflow-hidden"><div className="flex items-center justify-between gap-4 p-5 border-b border-white/10"><div><h3 className="text-2xl font-black">Detalle del pedido</h3><p className="text-sm text-slate-400">Información completa de la compra seleccionada.</p></div><button type="button" onClick={onClose} className="h-10 w-10 rounded-2xl bg-white/10 hover:bg-red-500/20 grid place-items-center text-slate-200" aria-label="Cerrar detalle">×</button></div><div className="grid grid-cols-1 md:grid-cols-[300px_1fr] gap-5 p-5 items-stretch"><div className="space-y-4"><div className="rounded-3xl bg-black/30 border border-white/10 p-4"><div className="flex items-start justify-between gap-3 mb-3"><p className="text-xs text-cyan-300 font-bold">Nº {order.id}</p><span className="bg-emerald-400/20 text-emerald-200 border-emerald-300/30 text-[10px] px-2 py-1 rounded-full border">Pagada</span></div><h4 className="text-xl font-black leading-tight">{order.product}</h4><p className="text-3xl font-black text-cyan-300 mt-2">{order.price}</p></div><div className="rounded-3xl overflow-hidden border border-white/10 bg-black/30 aspect-square"><img src={order.image} alt={order.product} className="w-full h-full object-cover" /></div></div><div className="grid grid-cols-1 gap-3 content-start"><InfoRow label="Comprador" value={order.customer} /><InfoRow label="Dirección" value={order.address} /><InfoRow label="Talla" value={order.size || "No especificada"} /><InfoRow label="Método de pago" value={order.method} /><InfoRow label="Fecha de compra" value={order.createdAt || "Sin fecha"} /></div></div></motion.div></div>;
+  const items = Array.isArray(order.items) ? order.items : [];
+  return <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"><motion.div initial={{ opacity: 0, scale: 0.95, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} className="w-full max-w-3xl max-h-[92vh] overflow-y-auto rounded-3xl bg-[#071120]/95 border border-white/10 shadow-2xl overflow-hidden"><div className="flex items-center justify-between gap-4 p-5 border-b border-white/10"><div><p className="text-xs font-black uppercase tracking-[0.24em] text-cyan-300">Boleta de venta</p><h3 className="text-2xl font-black">Pedido Nº {order.orderNumber || order.id}</h3><p className="text-sm text-slate-400">Pedido confirmado y listo para preparar envío.</p></div><button type="button" onClick={onClose} className="h-10 w-10 rounded-2xl bg-white/10 hover:bg-red-500/20 grid place-items-center text-slate-200" aria-label="Cerrar detalle">×</button></div><div className="p-5 space-y-5"><section className="rounded-3xl border border-cyan-400/15 bg-black/25 p-4"><div className="flex items-start justify-between gap-3 mb-4"><div><p className="text-xs text-cyan-300 font-bold">Cliente</p><h4 className="text-xl font-black leading-tight">{order.customer}</h4></div><span className="bg-emerald-400/20 text-emerald-200 border-emerald-300/30 text-[10px] px-2 py-1 rounded-full border">Pagada</span></div><div className="space-y-3">{items.map((item) => <div key={`${item.id}-${item.size}`} className="flex gap-3 rounded-2xl border border-white/10 bg-[#020817]/60 p-3"><div className="h-16 w-16 shrink-0 overflow-hidden rounded-2xl border border-white/10 bg-cyan-950/50">{item.image ? <img src={item.image} alt={item.name} className="h-full w-full object-cover" /> : <div className="grid h-full w-full place-items-center text-xs font-black text-cyan-100">OS</div>}</div><div className="min-w-0 flex-1"><p className="truncate font-black text-white">{item.name}</p><p className="mt-1 text-xs text-cyan-100/70">Talla {item.size} · Cant. {item.qty}</p></div><p className="text-sm font-black text-cyan-100">€ {(item.price * item.qty).toFixed(2)}</p></div>)}</div><div className="mt-4 flex items-center justify-between rounded-2xl bg-cyan-400/10 border border-cyan-400/15 p-4 text-xl font-black"><span>Total</span><span>€ {Number(order.total || 0).toFixed(2)}</span></div><div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3"><InfoRow label="Método de pago" value={order.method} /><InfoRow label="Fecha" value={order.approvedAt || order.createdAt || "Sin fecha"} /></div></section><div className="border-t border-white/10" /><section><div className="mb-3"><p className="text-xs font-black uppercase tracking-[0.24em] text-cyan-300">Etiqueta de envío</p><p className="text-sm text-slate-400">Datos del perfil registrado del cliente.</p></div><div className="grid grid-cols-1 md:grid-cols-2 gap-3"><InfoRow label="Nombre" value={order.customer} /><InfoRow label="Número" value={order.phone} /><InfoRow label="Dirección" value={order.address} /><InfoRow label="Código postal" value={order.postalCode} /><InfoRow label="Ciudad" value={order.city} /></div></section></div></motion.div></div>;
 }
 
 function EditProductModal({ editingProduct, editForm, setEditForm, editErrors, onSaveEdit, onCloseEdit }) {
@@ -652,8 +1326,8 @@ function InfoRow({ label, value }) {
   return <div className="rounded-2xl bg-black/30 border border-white/10 p-3"><p className="text-xs text-slate-500">{label}</p><p className="text-slate-200 font-semibold mt-1">{value}</p></div>;
 }
 
-function NavButton({ icon, label, active = false, collapsed = false, onClick }) {
-  return <button onClick={onClick} className={`${active ? "bg-cyan-400/15 border-cyan-300/30 text-cyan-200" : "bg-white/[0.03] border-white/5 hover:bg-cyan-400/10 hover:border-cyan-300/20"} w-full flex items-center gap-3 px-3 py-3 rounded-2xl border transition`}><Icon name={icon} className="h-5 w-5 text-cyan-300" />{!collapsed && <span>{label}</span>}</button>;
+function NavButton({ icon, label, active = false, collapsed = false, onClick, extra = null }) {
+  return <button onClick={onClick} className={`${active ? "bg-cyan-400/15 border-cyan-300/30 text-cyan-200" : "bg-white/[0.03] border-white/5 hover:bg-cyan-400/10 hover:border-cyan-300/20"} relative w-full flex items-center gap-3 px-3 py-3 rounded-2xl border transition`}><Icon name={icon} className="h-5 w-5 text-cyan-300" />{!collapsed && <span>{label}</span>}{extra}</button>;
 }
 
 function SearchBox({ value, onChange, placeholder, compact = false }) {
@@ -669,12 +1343,19 @@ function ProductCard({ product, onDelete, onEdit }) {
 }
 
 function OrderCard({ order, isSelected, onClick }) {
-  return <button onClick={onClick} className={`${isSelected ? "border-cyan-300/50 ring-1 ring-cyan-300/30" : "border-white/10"} relative text-left rounded-2xl overflow-hidden bg-black/30 border aspect-square group`}><img src={order.image} alt={order.product} className="absolute inset-0 h-full w-full object-cover group-hover:scale-105 transition duration-500" /><div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/35 to-transparent" /><div className="absolute top-2 right-2"><span className="bg-emerald-400/20 text-emerald-200 border-emerald-300/30 text-[9px] px-2 py-0.5 rounded-full border">Aprobada</span></div><div className="absolute bottom-0 p-3 w-full space-y-1"><p className="text-[10px] text-cyan-300 font-bold">Nº {order.id}</p><p className="text-[10px] text-slate-300 truncate">👤 {order.customer}</p><p className="text-[10px] text-slate-300 truncate">📍 {shortText(order.address, 25)}</p><p className="text-[10px] text-slate-300 truncate">💳 {order.method}</p><p className="text-xs text-cyan-300 font-black">{order.price}</p></div></button>;
+  const images = Array.isArray(order.images) && order.images.length ? order.images : (order.image ? [order.image] : []);
+  const visibleImages = images.slice(0, 4);
+  return <button onClick={onClick} className={`${isSelected ? "border-cyan-300/50 ring-1 ring-cyan-300/30" : "border-white/10"} relative text-left rounded-2xl overflow-hidden bg-black/30 border aspect-square group`}>
+    <div className={`absolute inset-0 grid ${visibleImages.length > 1 ? "grid-cols-2 grid-rows-2" : "grid-cols-1"}`}>{visibleImages.length ? visibleImages.map((image, index) => <div key={`${image}-${index}`} className="relative overflow-hidden bg-black/30"><img src={image} alt={`${order.product}-${index + 1}`} className="absolute inset-0 h-full w-full object-cover group-hover:scale-105 transition duration-500" />{index === 3 && images.length > 4 ? <div className="absolute inset-0 grid place-items-center bg-black/60 text-lg font-black">+{images.length - 4}</div> : null}</div>) : <div className="grid place-items-center bg-cyan-950/40 text-cyan-100 font-black">OS</div>}</div>
+    <div className="absolute inset-0 bg-gradient-to-t from-black/95 via-black/45 to-transparent" />
+    <div className="absolute top-2 right-2"><span className="bg-emerald-400/20 text-emerald-200 border-emerald-300/30 text-[9px] px-2 py-0.5 rounded-full border">Pagada</span></div>
+    <div className="absolute bottom-0 p-3 w-full space-y-1"><p className="text-[10px] text-cyan-300 font-bold">Pedido Nº {order.orderNumber || order.id}</p><p className="text-[10px] text-slate-300 truncate">👤 {order.customer}</p><p className="text-[10px] text-slate-300 truncate">📍 {shortText(order.address, 25)}</p><p className="text-[10px] text-slate-300 truncate">💳 {order.method}</p><p className="text-xs text-cyan-300 font-black">{order.price}</p></div>
+  </button>;
 }
 
 function MobileBottomNav({ activeSection, setActiveSection, goToProducts, goToOrders, goToPayments }) {
-  const items = [{ key: "dashboard", label: "Inicio", icon: "home", action: () => setActiveSection("dashboard") }, { key: "products", label: "Productos", icon: "package", action: goToProducts }, { key: "orders", label: "Pedidos", icon: "bag", action: goToOrders }, { key: "payments", label: "Pagos", icon: "card", action: goToPayments }];
-  return <nav className="fixed bottom-3 left-3 right-3 z-40 md:hidden rounded-3xl bg-[#071120]/95 border border-white/10 backdrop-blur-xl p-2 grid grid-cols-4 gap-1 shadow-2xl">{items.map((item) => <button key={item.key} onClick={item.action} className={`${activeSection === item.key ? "bg-cyan-400 text-slate-950" : "text-slate-300"} rounded-2xl py-2 text-[10px] font-bold flex flex-col items-center gap-1`}><Icon name={item.icon} className="h-4 w-4" />{item.label}</button>)}</nav>;
+  const items = [{ key: "dashboard", label: "Inicio", icon: "home", action: () => setActiveSection("dashboard") }, { key: "products", label: "Productos", icon: "package", action: goToProducts }, { key: "orders", label: "Pedidos", icon: "bag", action: goToOrders }, { key: "chat", label: "Chat", icon: "chat", action: () => setActiveSection("chat") }, { key: "payments", label: "Pagos", icon: "card", action: goToPayments }];
+  return <nav className="fixed bottom-3 left-3 right-3 z-40 md:hidden rounded-3xl bg-[#071120]/95 border border-white/10 backdrop-blur-xl p-2 grid grid-cols-5 gap-1 shadow-2xl">{items.map((item) => <button key={item.key} onClick={item.action} className={`${activeSection === item.key ? "bg-cyan-400 text-slate-950" : "text-slate-300"} rounded-2xl py-2 text-[10px] font-bold flex flex-col items-center gap-1`}><Icon name={item.icon} className="h-4 w-4" />{item.label}</button>)}</nav>;
 }
 
 function Stat({ title, value, icon }) {
@@ -693,10 +1374,14 @@ function Icon({ name, className = "h-5 w-5" }) {
     upload: <svg {...common}><path d="M12 16V4" /><path d="m7 9 5-5 5 5" /><path d="M20 16.5V19a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2.5" /></svg>,
     package: <svg {...common}><path d="M16.5 9.4 7.5 4.2" /><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" /><path d="M3.3 7 12 12l8.7-5" /><path d="M12 22V12" /><path d="M19 12h-4" /><path d="M17 10v4" /></svg>,
     bag: <svg {...common}><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z" /><path d="M3 6h18" /><path d="M16 10a4 4 0 0 1-8 0" /></svg>,
+    bagGlow: <svg {...common}><path d="M6 7h12l1 14H5L6 7Z" /><path d="M9 7a3 3 0 0 1 6 0" /><path d="M9 12h6" /></svg>,
+    boxDone: <svg {...common}><path d="M16.5 9.4 7.5 4.2" /><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" /><path d="M3.3 7 12 12l8.7-5" /><path d="M12 22V12" /></svg>,
     chat: <svg {...common}><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4Z" /></svg>,
     trash: <svg {...common}><path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /></svg>,
     eye: <svg {...common}><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></svg>,
     card: <svg {...common}><rect x="2" y="5" width="20" height="14" rx="2" /><path d="M2 10h20" /></svg>,
+    receipt: <svg {...common}><path d="M4 3h16v18l-2-1-2 1-2-1-2 1-2-1-2 1-2-1-2 1V3Z" /><path d="M8 7h8" /><path d="M8 11h8" /><path d="M8 15h5" /></svg>,
+    close: <svg {...common}><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>,
     image: <svg {...common}><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="9" cy="9" r="2" /><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21" /></svg>,
     send: <svg {...common}><path d="m22 2-7 20-4-9-9-4Z" /><path d="M22 2 11 13" /></svg>,
     menu: <svg {...common}><path d="M4 6h16" /><path d="M4 12h16" /><path d="M4 18h16" /></svg>,
