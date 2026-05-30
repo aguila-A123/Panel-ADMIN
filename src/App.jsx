@@ -232,6 +232,17 @@ function formatChatTime(value) {
   return date.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
 }
 
+function getDateParts(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return { date: "Sin fecha", time: String(value || "--:--") };
+  }
+  return {
+    date: date.toLocaleDateString("es-ES", { day: "2-digit", month: "2-digit", year: "numeric" }),
+    time: date.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", hour12: false }),
+  };
+}
+
 function getProfileName(profile, fallback = "Cliente") {
   return profile?.full_name || profile?.name || profile?.nombre || profile?.username || profile?.email?.split("@")[0] || fallback;
 }
@@ -243,6 +254,7 @@ function normalizeChatMessage(message = {}) {
     type: message.type || null,
     text: message.text || "",
     time: message.time || nowTime(),
+    createdAt: message.createdAt || message.created_at || null,
     items: Array.isArray(message.items) ? message.items : undefined,
     buttons: Array.isArray(message.buttons) ? message.buttons : undefined,
     paymentCard: message.paymentCard || undefined,
@@ -268,6 +280,7 @@ function chatMessageFromDb(row) {
     type: parsed?.type || metadata.type || row?.type || null,
     text: parsed?.text || (typeof raw === "string" && raw.startsWith("{") ? "" : parsed?.text) || "",
     time: parsed?.time || formatChatTime(row?.created_at),
+    createdAt: row?.created_at || parsed?.createdAt || metadata.createdAt || null,
     items: parsed?.items || metadata.items,
     buttons: parsed?.buttons || metadata.buttons,
     paymentCard: parsed?.paymentCard || metadata.paymentCard,
@@ -334,6 +347,8 @@ function buildOrderSummaries(messages = []) {
         items,
         total,
         time: message.time,
+        createdAt: message.createdAt || null,
+        approvedAt: null,
         paymentMethod: "Pendiente",
         customerPaymentReported: false,
         adminConfirmed: false,
@@ -351,8 +366,10 @@ function buildOrderSummaries(messages = []) {
     if (method) target.paymentMethod = method;
 
     if (message.type === "payment_confirmed") {
-      if (message.adminConfirmed === true) target.adminConfirmed = true;
-      else target.customerPaymentReported = true;
+      if (message.adminConfirmed === true) {
+        target.adminConfirmed = true;
+        target.approvedAt = message.createdAt || null;
+      } else target.customerPaymentReported = true;
     }
   });
 
@@ -410,8 +427,8 @@ function buildConfirmedOrdersFromData(conversations = [], rawMessages = [], prof
             method: order.paymentMethod || "Pendiente",
             total: order.total,
             price: `€ ${order.total.toFixed(2)}`,
-            createdAt: order.time || formatChatTime(conversation.created_at),
-            approvedAt: order.time || formatChatTime(conversation.created_at),
+            createdAt: order.createdAt || conversation.created_at || null,
+            approvedAt: order.approvedAt || order.createdAt || conversation.created_at || null,
             status: "Pagada",
           };
         });
@@ -1289,8 +1306,19 @@ function PaymentsPage({ orders, totalSales, paymentStats }) {
   return <section className="pb-8 space-y-5"><motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="rounded-3xl bg-white/[0.06] border border-white/10 p-6 shadow-2xl overflow-hidden relative"><div className="absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(34,211,238,.18),transparent_35%)]" /><div className="relative flex flex-col lg:flex-row lg:items-end lg:justify-between gap-5"><div><p className="text-cyan-300 text-sm font-bold">RESUMEN DE INGRESOS</p><h3 className="text-4xl md:text-5xl font-black mt-2">€ {totalSales.toFixed(2)}</h3><p className="text-slate-400 mt-2">Total ganado por ventas registradas.</p></div><div className="grid grid-cols-3 gap-3 w-full lg:w-auto"><MiniPay label="Ventas" value={orders.length} /><MiniPay label="Métodos" value={PAYMENT_METHODS.length} /><MiniPay label="Estado" value="OK" /></div></div></motion.div><section className="grid grid-cols-1 md:grid-cols-3 gap-4"><PaymentMethodCard method="Bizum" data={paymentStats.Bizum} icon="card" /><PaymentMethodCard method="PayPal" data={paymentStats.PayPal} icon="card" /><PaymentMethodCard method="Transferencias" data={paymentStats.Transferencias} icon="card" /></section><motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }} className="rounded-3xl bg-white/[0.06] border border-white/10 p-5 shadow-2xl"><div className="flex items-center gap-3 mb-5"><div className="p-3 rounded-2xl bg-cyan-400/10 text-cyan-300"><Icon name="clock" className="h-5 w-5" /></div><div><h3 className="text-xl font-black">Últimos pagos</h3><p className="text-sm text-slate-400">Movimientos recientes por método de pago.</p></div></div>{latestPayments.length === 0 ? <EmptyBox text="No hay pagos conectados todavía." /> : <div className="space-y-3">{latestPayments.map((order) => <PaymentRow key={order.id} order={order} />)}</div>}</motion.div></section>;
 }
 
+function DateTimeInline({ value, compact = false }) {
+  const parts = getDateParts(value);
+  return (
+    <span className={`inline-flex ${compact ? "flex-col items-start gap-1" : "flex-wrap items-center gap-2"} text-cyan-100/85`}>
+      <span className="inline-flex items-center gap-1.5"><Icon name="calendar" className="h-3.5 w-3.5 text-cyan-300" />{parts.date}</span>
+      {!compact && <span className="text-cyan-300/45">-</span>}
+      <span className="inline-flex items-center gap-1.5"><Icon name="clock" className="h-3.5 w-3.5 text-cyan-300" />{parts.time}</span>
+    </span>
+  );
+}
+
 function PaymentRow({ order }) {
-  return <div className="rounded-2xl bg-black/25 border border-emerald-300/20 p-4 flex items-center gap-4"><img src={order.image} alt={order.product} className="h-14 w-14 rounded-2xl object-cover border border-white/10" /><div className="min-w-0 flex-1"><p className="font-black text-sm truncate">{order.customer}</p><p className="text-xs text-slate-400 truncate">{order.method} • {order.createdAt}</p></div><p className="text-cyan-300 font-black">{order.price}</p></div>;
+  return <div className="rounded-2xl bg-black/25 border border-emerald-300/20 p-4 flex items-center gap-4"><img src={order.image} alt={order.product} className="h-14 w-14 rounded-2xl object-cover border border-white/10" /><div className="min-w-0 flex-1"><p className="font-black text-sm truncate">{order.customer}</p><p className="text-xs text-slate-400 truncate">{order.method} • <DateTimeInline value={order.approvedAt || order.createdAt} /></p></div><p className="text-cyan-300 font-black">{order.price}</p></div>;
 }
 
 function MiniPay({ label, value }) {
@@ -1315,7 +1343,7 @@ function ProductsPage({ products, filteredProducts, productSearch, setProductSea
 
 function OrderDetailModal({ order, onClose }) {
   const items = Array.isArray(order.items) ? order.items : [];
-  return <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"><motion.div initial={{ opacity: 0, scale: 0.95, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} className="w-full max-w-3xl max-h-[92vh] overflow-y-auto rounded-3xl bg-[#071120]/95 border border-white/10 shadow-2xl overflow-hidden"><div className="flex items-center justify-between gap-4 p-5 border-b border-white/10"><div><p className="text-xs font-black uppercase tracking-[0.24em] text-cyan-300">Boleta de venta</p><h3 className="text-2xl font-black">Pedido Nº {order.orderNumber || order.id}</h3><p className="text-sm text-slate-400">Pedido confirmado y listo para preparar envío.</p></div><button type="button" onClick={onClose} className="h-10 w-10 rounded-2xl bg-white/10 hover:bg-red-500/20 grid place-items-center text-slate-200" aria-label="Cerrar detalle">×</button></div><div className="p-5 space-y-5"><section className="rounded-3xl border border-cyan-400/15 bg-black/25 p-4"><div className="flex items-start justify-between gap-3 mb-4"><div><p className="text-xs text-cyan-300 font-bold">Cliente</p><h4 className="text-xl font-black leading-tight">{order.customer}</h4></div><span className="bg-emerald-400/20 text-emerald-200 border-emerald-300/30 text-[10px] px-2 py-1 rounded-full border">Pagada</span></div><div className="space-y-3">{items.map((item) => <div key={`${item.id}-${item.size}`} className="flex gap-3 rounded-2xl border border-white/10 bg-[#020817]/60 p-3"><div className="h-16 w-16 shrink-0 overflow-hidden rounded-2xl border border-white/10 bg-cyan-950/50">{item.image ? <img src={item.image} alt={item.name} className="h-full w-full object-cover" /> : <div className="grid h-full w-full place-items-center text-xs font-black text-cyan-100">OS</div>}</div><div className="min-w-0 flex-1"><p className="truncate font-black text-white">{item.name}</p><p className="mt-1 text-xs text-cyan-100/70">Talla {item.size} · Cant. {item.qty}</p></div><p className="text-sm font-black text-cyan-100">€ {(item.price * item.qty).toFixed(2)}</p></div>)}</div><div className="mt-4 flex items-center justify-between rounded-2xl bg-cyan-400/10 border border-cyan-400/15 p-4 text-xl font-black"><span>Total</span><span>€ {Number(order.total || 0).toFixed(2)}</span></div><div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3"><InfoRow label="Método de pago" value={order.method} /><InfoRow label="Fecha" value={order.approvedAt || order.createdAt || "Sin fecha"} /></div></section><div className="border-t border-white/10" /><section><div className="mb-3"><p className="text-xs font-black uppercase tracking-[0.24em] text-cyan-300">Etiqueta de envío</p><p className="text-sm text-slate-400">Datos del perfil registrado del cliente.</p></div><div className="grid grid-cols-1 md:grid-cols-2 gap-3"><InfoRow label="Nombre" value={order.customer} /><InfoRow label="Número" value={order.phone} /><InfoRow label="Dirección" value={order.address} /><InfoRow label="Código postal" value={order.postalCode} /><InfoRow label="Ciudad" value={order.city} /></div></section></div></motion.div></div>;
+  return <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md"><motion.div initial={{ opacity: 0, scale: 0.95, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} className="w-full max-w-3xl max-h-[92vh] overflow-y-auto rounded-3xl bg-[#071120]/95 border border-white/10 shadow-2xl overflow-hidden"><div className="flex items-center justify-between gap-4 p-5 border-b border-white/10"><div><p className="text-xs font-black uppercase tracking-[0.24em] text-cyan-300">Boleta de venta</p><h3 className="text-2xl font-black">Pedido Nº {order.orderNumber || order.id}</h3><p className="text-sm text-slate-400">Pedido confirmado y listo para preparar envío.</p></div><button type="button" onClick={onClose} className="h-10 w-10 rounded-2xl bg-white/10 hover:bg-red-500/20 grid place-items-center text-slate-200" aria-label="Cerrar detalle">×</button></div><div className="p-5 space-y-5"><section className="rounded-3xl border border-cyan-400/15 bg-black/25 p-4"><div className="flex items-start justify-between gap-3 mb-4"><div><p className="text-xs text-cyan-300 font-bold">Cliente</p><h4 className="text-xl font-black leading-tight">{order.customer}</h4></div><span className="bg-emerald-400/20 text-emerald-200 border-emerald-300/30 text-[10px] px-2 py-1 rounded-full border">Pagada</span></div><div className="space-y-3">{items.map((item) => <div key={`${item.id}-${item.size}`} className="flex gap-3 rounded-2xl border border-white/10 bg-[#020817]/60 p-3"><div className="h-16 w-16 shrink-0 overflow-hidden rounded-2xl border border-white/10 bg-cyan-950/50">{item.image ? <img src={item.image} alt={item.name} className="h-full w-full object-cover" /> : <div className="grid h-full w-full place-items-center text-xs font-black text-cyan-100">OS</div>}</div><div className="min-w-0 flex-1"><p className="truncate font-black text-white">{item.name}</p><p className="mt-1 text-xs text-cyan-100/70">Talla {item.size} · Cant. {item.qty}</p></div><p className="text-sm font-black text-cyan-100">€ {(item.price * item.qty).toFixed(2)}</p></div>)}</div><div className="mt-4 flex items-center justify-between rounded-2xl bg-cyan-400/10 border border-cyan-400/15 p-4 text-xl font-black"><span>Total</span><span>€ {Number(order.total || 0).toFixed(2)}</span></div><div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3"><InfoRow label="Método de pago" value={order.method} /><InfoRow label="Fecha" value={<DateTimeInline value={order.approvedAt || order.createdAt} />} /></div></section><div className="border-t border-white/10" /><section><div className="mb-3"><p className="text-xs font-black uppercase tracking-[0.24em] text-cyan-300">Etiqueta de envío</p><p className="text-sm text-slate-400">Datos del perfil registrado del cliente.</p></div><div className="grid grid-cols-1 md:grid-cols-2 gap-3"><InfoRow label="Nombre" value={order.customer} /><InfoRow label="Número" value={order.phone} /><InfoRow label="Dirección" value={order.address} /><InfoRow label="Código postal" value={order.postalCode} /><InfoRow label="Ciudad" value={order.city} /></div></section></div></motion.div></div>;
 }
 
 function EditProductModal({ editingProduct, editForm, setEditForm, editErrors, onSaveEdit, onCloseEdit }) {
@@ -1349,7 +1377,7 @@ function OrderCard({ order, isSelected, onClick }) {
     <div className={`absolute inset-0 grid ${visibleImages.length > 1 ? "grid-cols-2 grid-rows-2" : "grid-cols-1"}`}>{visibleImages.length ? visibleImages.map((image, index) => <div key={`${image}-${index}`} className="relative overflow-hidden bg-black/30"><img src={image} alt={`${order.product}-${index + 1}`} className="absolute inset-0 h-full w-full object-cover group-hover:scale-105 transition duration-500" />{index === 3 && images.length > 4 ? <div className="absolute inset-0 grid place-items-center bg-black/60 text-lg font-black">+{images.length - 4}</div> : null}</div>) : <div className="grid place-items-center bg-cyan-950/40 text-cyan-100 font-black">OS</div>}</div>
     <div className="absolute inset-0 bg-gradient-to-t from-black/95 via-black/45 to-transparent" />
     <div className="absolute top-2 right-2"><span className="bg-emerald-400/20 text-emerald-200 border-emerald-300/30 text-[9px] px-2 py-0.5 rounded-full border">Pagada</span></div>
-    <div className="absolute bottom-0 p-3 w-full space-y-1"><p className="text-[10px] text-cyan-300 font-bold">Pedido Nº {order.orderNumber || order.id}</p><p className="text-[10px] text-slate-300 truncate">👤 {order.customer}</p><p className="text-[10px] text-slate-300 truncate">📍 {shortText(order.address, 25)}</p><p className="text-[10px] text-slate-300 truncate">💳 {order.method}</p><p className="text-xs text-cyan-300 font-black">{order.price}</p></div>
+    <div className="absolute bottom-0 p-3 w-full space-y-1"><p className="text-[10px] text-cyan-300 font-bold">Pedido Nº {order.orderNumber || order.id}</p><p className="text-[10px] text-slate-300 truncate">👤 {order.customer}</p><p className="text-[10px] text-slate-300 truncate">📍 {shortText(order.address, 25)}</p><p className="text-[10px] text-slate-300 truncate">💳 {order.method}</p><p className="text-[10px] font-semibold text-cyan-100/90"><DateTimeInline value={order.approvedAt || order.createdAt} compact /></p><p className="text-xs text-cyan-300 font-black">{order.price}</p></div>
   </button>;
 }
 
@@ -1386,6 +1414,7 @@ function Icon({ name, className = "h-5 w-5" }) {
     send: <svg {...common}><path d="m22 2-7 20-4-9-9-4Z" /><path d="M22 2 11 13" /></svg>,
     menu: <svg {...common}><path d="M4 6h16" /><path d="M4 12h16" /><path d="M4 18h16" /></svg>,
     check: <svg {...common}><circle cx="12" cy="12" r="10" /><path d="M8 12l3 3 5-6" /></svg>,
+    calendar: <svg {...common}><rect x="3" y="4" width="18" height="18" rx="2" /><path d="M16 2v4" /><path d="M8 2v4" /><path d="M3 10h18" /></svg>,
     clock: <svg {...common}><circle cx="12" cy="12" r="10" /><path d="M12 6v6l4 2" /></svg>,
   };
   return icons[name] || icons.package;
