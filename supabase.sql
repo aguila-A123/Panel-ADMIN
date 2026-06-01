@@ -33,3 +33,4 @@ on public.product_sizes
 for all
 using (true)
 with check (true);
+
