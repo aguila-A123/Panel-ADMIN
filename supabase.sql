@@ -34,3 +34,36 @@ for all
 using (true)
 with check (true);
 
+
+-- Categorías para productos (necesario para el nuevo apartado "Categoría")
+alter table public.products add column if not exists category text;
+alter table public.products add column if not exists category_extra text;
+
+-- Monitor del worker NACEX / Servicio de etiquetas
+create table if not exists public.worker_status (
+  id text primary key,
+  name text,
+  status text,
+  last_seen timestamptz,
+  last_error text,
+  updated_at timestamptz default now()
+);
+
+alter table public.worker_status enable row level security;
+
+drop policy if exists "worker_status_select" on public.worker_status;
+create policy "worker_status_select"
+on public.worker_status
+for select
+using (true);
+
+drop policy if exists "worker_status_all" on public.worker_status;
+create policy "worker_status_all"
+on public.worker_status
+for all
+using (true)
+with check (true);
+
+insert into public.worker_status (id, name, status, last_seen, updated_at)
+values ('nacex_worker', 'Servicio de etiquetas', 'inactive', now(), now())
+on conflict (id) do nothing;

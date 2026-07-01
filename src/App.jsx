@@ -9,6 +9,7 @@ const PAYMENT_METHODS = ["Bizum", "PayPal", "Transferencias"];
 const CLOUDINARY_CLOUD_NAME = "dqgvufybv";
 const CLOUDINARY_UPLOAD_PRESET = "outlet_products";
 const CLOUDINARY_FOLDER = "outlet-stock/products";
+const CATEGORY_OPTIONS = ["Ropa", "Calzado", "Accesorios", "Bolsos", "Hogar", "Tecnología", "Otros"];
 
 const SUPABASE_URL = "https://qpkdaubarqnutbunckeh.supabase.co";
 const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwa2RhdWJhcnFudXRidW5ja2VoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc1NjAzMjAsImV4cCI6MjA5MzEzNjMyMH0.36MsbMngO6lOBzFvKNsMHxk_djEYpzKR3sdCxsT8ids";
@@ -22,6 +23,11 @@ const SIZE_PRICE_COLUMN = "price";
 const SIZE_STOCK_COLUMN = "stock";
 const CONFIRMED_ORDERS_TABLE = "confirmed_orders";
 const DELETED_CONFIRMED_ORDERS_TABLE = "deleted_confirmed_orders";
+const WORKER_STATUS_TABLE = "worker_status";
+const WORKER_STATUS_ID = "nacex_worker";
+const WORKER_DEAD_AFTER_SECONDS = 20;
+const WORKER_CHECK_INTERVAL_MS = 10000;
+const WORKER_LOCAL_TICK_MS = 1000;
 
 function createEmptyProductForm() {
   return {
@@ -29,6 +35,9 @@ function createEmptyProductForm() {
     description: "",
     price: "",
     stock: "0",
+    category: "",
+    categoryExtraEnabled: false,
+    categoryExtra: "",
     useSizePricing: false,
     sizes: { ...DEFAULT_SIZES },
     sizeStocks: { ...DEFAULT_SIZE_STOCKS },
@@ -74,6 +83,7 @@ function validateProduct(values) {
   const errors = {};
   if (!String(values.title || "").trim()) errors.title = "El título es obligatorio.";
   if (!String(values.description || "").trim()) errors.description = "La descripción es obligatoria.";
+  if (!String(values.category || "").trim()) errors.category = "La categoría es obligatoria.";
 
   if (values.useSizePricing) {
     const hasValidSize = Object.values(values.sizes || {}).some((value) => Number(value) > 0);
@@ -141,6 +151,9 @@ function mapSupabaseProduct(row) {
     description: row.description || row.descripcion || row["descripción"] || "Sin descripción",
     image: normalizeImageUrl(row.image_url || row.url_de_la_imagen || row.imagen_url || row.image || row["URL de la imagen"]),
     status: row.status || row.estado || "Activo",
+    category: row.category || row.categoria || row["categoría"] || "",
+    categoryExtra: row.category_extra || row.categoria_extra || row["categoría extra"] || "",
+    categoryExtraEnabled: Boolean(row.category_extra || row.categoria_extra || row["categoría extra"]),
     useSizePricing: false,
     sizes: null,
     sizeStocks: null,
@@ -183,6 +196,8 @@ function productToSupabasePayload(product) {
     price: Number(product.price || 0),
     image_url: normalizeImageUrl(product.image),
     status: product.status || "Activo",
+    category: String(product.category || "").trim(),
+    category_extra: product.categoryExtraEnabled ? String(product.categoryExtra || "").trim() : "",
   };
 }
 
@@ -1094,7 +1109,7 @@ export default function AdminCatalogPanel() {
 
   const filteredProducts = useMemo(() => {
     const query = normalizeText(productSearch);
-    return products.filter((product) => normalizeText(`${product.title} ${product.description} ${product.price} ${product.status}`).includes(query));
+    return products.filter((product) => normalizeText(`${product.title} ${product.description} ${product.price} ${product.status} ${product.category} ${product.categoryExtra}`).includes(query));
   }, [products, productSearch]);
 
   const visibleProducts = useMemo(() => filteredProducts.slice(0, 4), [filteredProducts]);
@@ -1155,6 +1170,9 @@ export default function AdminCatalogPanel() {
       useSizePricing: form.useSizePricing,
       sizes: form.useSizePricing ? { ...form.sizes } : null,
       sizeStocks: form.useSizePricing ? { ...form.sizeStocks } : null,
+      category: form.category.trim(),
+      categoryExtraEnabled: Boolean(form.categoryExtraEnabled),
+      categoryExtra: form.categoryExtraEnabled ? form.categoryExtra.trim() : "",
       image: imageUrl || fallbackImage,
       status: "Activo",
     };
@@ -1223,6 +1241,9 @@ export default function AdminCatalogPanel() {
       imageUrl: product.image,
       imagePreview: "",
       imageFile: null,
+      category: product.category || "",
+      categoryExtraEnabled: Boolean(product.categoryExtra),
+      categoryExtra: product.categoryExtra || "",
       useSizePricing: Boolean(product.useSizePricing),
       sizes: product.useSizePricing ? { ...DEFAULT_SIZES, ...(product.sizes || {}) } : { ...DEFAULT_SIZES },
       sizeStocks: product.useSizePricing ? { ...DEFAULT_SIZE_STOCKS, ...(product.sizeStocks || {}) } : { ...DEFAULT_SIZE_STOCKS },
@@ -1265,6 +1286,9 @@ export default function AdminCatalogPanel() {
       useSizePricing: editForm.useSizePricing,
       sizes: editForm.useSizePricing ? { ...editForm.sizes } : null,
       sizeStocks: editForm.useSizePricing ? { ...editForm.sizeStocks } : null,
+      category: editForm.category.trim(),
+      categoryExtraEnabled: Boolean(editForm.categoryExtraEnabled),
+      categoryExtra: editForm.categoryExtraEnabled ? editForm.categoryExtra.trim() : "",
       image: imageUrl,
       status: editingProduct.status || "Activo",
     };
@@ -1417,6 +1441,99 @@ export default function AdminCatalogPanel() {
       {editingProduct && <EditProductModal editingProduct={editingProduct} editForm={editForm} setEditForm={setEditForm} editErrors={editErrors} onSaveEdit={saveEditedProduct} onCloseEdit={closeEditForm} />}
       {viewingOrder && <OrderDetailModal order={viewingOrder} onClose={() => setViewingOrder(null)} />}
       {orderDeleteFlow && <OrderDeleteModal flow={orderDeleteFlow} orders={orders} onCancel={closeOrderDeleteFlow} onSelectOrder={(order) => setOrderDeleteFlow((current) => ({ ...(current || {}), mode: "confirm-one", order }))} onSelectAll={() => setOrderDeleteFlow((current) => ({ ...(current || {}), mode: "confirm-all", order: null }))} onConfirmOne={(order) => deleteConfirmedOrderById(order.id)} onConfirmAll={deleteAllConfirmedOrders} />}
+      <WorkerStatusWidget />
+    </div>
+  );
+}
+
+
+function formatWorkerRelativeTime(value) {
+  if (!value) return "sin señal";
+  const date = new Date(value);
+  const timestamp = date.getTime();
+  if (!Number.isFinite(timestamp)) return "sin señal";
+  const diffSeconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (diffSeconds < 5) return "ahora";
+  if (diffSeconds < 60) return `hace ${diffSeconds}s`;
+  const diffMinutes = Math.floor(diffSeconds / 60);
+  if (diffMinutes < 60) return `hace ${diffMinutes} min`;
+  const diffHours = Math.floor(diffMinutes / 60);
+  return `hace ${diffHours} h`;
+}
+
+function WorkerStatusWidget() {
+  const [worker, setWorker] = useState({ state: "checking", lastSeen: null, error: "" });
+  const [nowTick, setNowTick] = useState(Date.now());
+
+  async function checkWorkerStatus() {
+    const { data, error } = await supabase
+      .from(WORKER_STATUS_TABLE)
+      .select("id,name,status,last_seen,last_error,updated_at")
+      .eq("id", WORKER_STATUS_ID)
+      .maybeSingle();
+
+    if (error) {
+      setWorker({ state: "unavailable", lastSeen: null, error: "No se pudo leer el monitor" });
+      return;
+    }
+
+    if (!data?.last_seen) {
+      setWorker({ state: "ready", lastSeen: null, error: "Sin señal del worker" });
+      return;
+    }
+
+    setWorker({
+      state: "ready",
+      lastSeen: data.last_seen,
+      error: data.last_error || "",
+    });
+  }
+
+  useEffect(() => {
+    checkWorkerStatus();
+
+    // Optimizado para 24/7:
+    // - Supabase se consulta cada 10s.
+    // - El contador visual se actualiza localmente cada 1s sin llamar a Supabase.
+    // - Si pasan más de 20s sin last_seen nuevo, se declara inactivo localmente.
+    const supabaseInterval = window.setInterval(checkWorkerStatus, WORKER_CHECK_INTERVAL_MS);
+    const localTickInterval = window.setInterval(() => setNowTick(Date.now()), WORKER_LOCAL_TICK_MS);
+
+    return () => {
+      window.clearInterval(supabaseInterval);
+      window.clearInterval(localTickInterval);
+    };
+  }, []);
+
+  const lastSeenTime = worker.lastSeen ? new Date(worker.lastSeen).getTime() : NaN;
+  const diffSeconds = Number.isFinite(lastSeenTime) ? (nowTick - lastSeenTime) / 1000 : 9999;
+  const isChecking = worker.state === "checking";
+  const isUnavailable = worker.state === "unavailable";
+  const isActive = !isChecking && !isUnavailable && !!worker.lastSeen && diffSeconds <= WORKER_DEAD_AFTER_SECONDS;
+  const statusText = isChecking ? "Comprobando..." : isActive ? "Automático activo" : isUnavailable ? "Monitor no disponible" : "Automático inactivo";
+  const dotClass = isChecking ? "bg-yellow-300 shadow-[0_0_18px_rgba(253,224,71,.75)]" : isActive ? "bg-emerald-400 shadow-[0_0_18px_rgba(52,211,153,.85)]" : "bg-red-400 shadow-[0_0_18px_rgba(248,113,113,.75)]";
+  const borderClass = isActive ? "border-emerald-300/25 shadow-emerald-500/10" : isChecking ? "border-yellow-300/25 shadow-yellow-500/10" : "border-red-300/25 shadow-red-500/10";
+
+  function handleActivateClick() {
+    alert("Para activarlo, abre nacex_worker.exe en el PC donde está la impresora. Si pasan más de 20 segundos sin señal del worker, este aviso se pondrá Inactivo automáticamente.");
+  }
+
+  return (
+    <div className={`fixed left-4 bottom-24 md:bottom-4 z-50 w-[260px] rounded-3xl border ${borderClass} bg-[#061223]/95 p-3 text-white shadow-2xl backdrop-blur-xl`}>
+      <div className="flex items-start gap-3">
+        <span className={`mt-1 h-3 w-3 shrink-0 rounded-full ${dotClass}`} />
+        <div className="min-w-0 flex-1">
+          <p className="text-[11px] font-black uppercase tracking-[0.18em] text-cyan-200/80">Servicio de etiquetas</p>
+          <p className="mt-1 text-sm font-black text-white">{statusText}</p>
+          <p className="mt-1 text-[11px] text-slate-400">Última señal: {formatWorkerRelativeTime(worker.lastSeen)}</p>
+          {worker.error && <p className="mt-1 truncate text-[10px] text-yellow-100/80" title={worker.error}>{worker.error}</p>}
+          {!isActive && !isChecking && (
+            <button type="button" onClick={handleActivateClick} className="mt-3 w-full rounded-2xl border border-cyan-300/20 bg-cyan-400/10 px-3 py-2 text-xs font-black text-cyan-100 transition hover:bg-cyan-400/20">
+              Activar automático
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -1524,8 +1641,19 @@ function DashboardPage(props) {
 
 function ProductFormSections({ form, setForm, errors }) {
   const [activeTab, setActiveTab] = useState("info");
-  const tabs = [{ key: "info", label: "Información" }, { key: "sizes", label: "Tallas y stock" }];
-  return <div className="max-w-full rounded-3xl bg-black/20 border border-white/10 overflow-hidden"><div className="grid grid-cols-2 gap-2 p-2 bg-black/20 border-b border-white/10">{tabs.map((tab) => <button key={tab.key} type="button" onClick={() => setActiveTab(tab.key)} className={`${activeTab === tab.key ? "bg-cyan-400 text-slate-950" : "bg-white/5 text-slate-300 hover:bg-white/10"} rounded-2xl px-4 py-3 text-sm font-black transition`}>{tab.label}</button>)}</div><div className="p-4 space-y-4">{activeTab === "info" ? <><Field error={errors.title} label="Título del producto" value={form.title} onChange={(value) => setForm({ ...form, title: value })} placeholder="Ej: Camiseta" /><div><label className="text-sm text-slate-300">Descripción</label><textarea value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} placeholder="Describe el producto..." className="mt-2 w-full min-h-32 rounded-2xl bg-black/30 border border-white/10 px-4 py-3 outline-none focus:border-cyan-300/60 resize-none" />{errors.description && <p className="text-xs text-red-300 mt-2">{errors.description}</p>}</div></> : <SizePricingControl form={form} setForm={setForm} errors={errors} />}</div></div>;
+  const tabs = [{ key: "info", label: "Información" }, { key: "sizes", label: "Tallas y stock" }, { key: "category", label: "Categoría" }];
+  return <div className="max-w-full rounded-3xl bg-black/20 border border-white/10 overflow-hidden"><div className="grid grid-cols-3 gap-2 p-2 bg-black/20 border-b border-white/10">{tabs.map((tab) => <button key={tab.key} type="button" onClick={() => setActiveTab(tab.key)} className={`${activeTab === tab.key ? "bg-cyan-400 text-slate-950" : "bg-white/5 text-slate-300 hover:bg-white/10"} rounded-2xl px-3 py-3 text-xs sm:text-sm font-black transition`}>{tab.label}</button>)}</div><div className="p-4 space-y-4">{activeTab === "info" ? <><Field error={errors.title} label="Título del producto" value={form.title} onChange={(value) => setForm({ ...form, title: value })} placeholder="Ej: Camiseta" /><div><label className="text-sm text-slate-300">Descripción</label><textarea value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} placeholder="Describe el producto..." className="mt-2 w-full min-h-32 rounded-2xl bg-black/30 border border-white/10 px-4 py-3 outline-none focus:border-cyan-300/60 resize-none" />{errors.description && <p className="text-xs text-red-300 mt-2">{errors.description}</p>}</div></> : activeTab === "sizes" ? <SizePricingControl form={form} setForm={setForm} errors={errors} /> : <CategoryControl form={form} setForm={setForm} errors={errors} />}</div></div>;
+}
+
+function CategoryControl({ form, setForm, errors }) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const selectedCategory = form.category || "";
+  const selectCategory = (category) => {
+    setForm({ ...form, category });
+    setPickerOpen(false);
+  };
+
+  return <div className="space-y-4"><div className="rounded-3xl bg-white/[0.04] border border-white/10 p-4"><div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3"><div><p className="text-sm text-slate-300 font-bold">Categoría del producto</p><p className="text-xs text-slate-500">Este campo es obligatorio para publicar la prenda.</p></div><button type="button" onClick={() => setPickerOpen((value) => !value)} className="px-4 py-2.5 rounded-2xl bg-cyan-400 text-slate-950 text-xs font-black transition hover:scale-[1.01]">{selectedCategory ? `Cambiar: ${selectedCategory}` : "Escoger categoría"}</button></div>{errors.category && <p className="text-xs text-red-300 mt-3">{errors.category}</p>}{pickerOpen && <div className="mt-4 rounded-3xl border border-cyan-300/20 bg-black/30 p-3"><p className="text-xs font-black uppercase tracking-[0.18em] text-cyan-300 mb-3">Escoge una categoría</p><div className="grid grid-cols-2 sm:grid-cols-3 gap-2">{CATEGORY_OPTIONS.map((category) => <button key={category} type="button" onClick={() => selectCategory(category)} className={`${selectedCategory === category ? "bg-cyan-400 text-slate-950" : "bg-white/5 text-slate-300 hover:bg-white/10"} rounded-2xl px-3 py-2.5 text-xs font-black transition`}>{category}</button>)}</div></div>}</div><div className="rounded-3xl bg-white/[0.04] border border-white/10 p-4"><div className="flex items-center justify-between gap-3"><div><p className="text-sm text-slate-300 font-bold">Agregar algo más</p><p className="text-xs text-slate-500">Actívalo si quieres guardar un detalle extra dentro de la categoría.</p></div><button type="button" onClick={() => setForm({ ...form, categoryExtraEnabled: !form.categoryExtraEnabled, categoryExtra: form.categoryExtraEnabled ? "" : form.categoryExtra })} className={`${form.categoryExtraEnabled ? "bg-cyan-400 text-slate-950" : "bg-white/10 text-slate-300"} px-4 py-2 rounded-2xl text-xs font-black transition`}>{form.categoryExtraEnabled ? "Activado" : "Activar"}</button></div>{form.categoryExtraEnabled && <div className="mt-4"><Field label="Detalle extra de categoría" value={form.categoryExtra} onChange={(value) => setForm({ ...form, categoryExtra: value })} placeholder="Ej: Mujer, Hombre, Niños, Verano..." /></div>}</div></div>;
 }
 
 function ProductImagePicker({ form, setForm, handleImageUpload, removeSelectedImage }) {
@@ -1642,7 +1770,7 @@ function EmptyBox({ text }) {
 }
 
 function ProductCard({ product, onDelete, onEdit }) {
-  return <div className="relative rounded-2xl overflow-hidden border border-white/10 group aspect-square bg-black/30"><img src={product.image} alt={product.title} onError={(event) => { event.currentTarget.src = fallbackImage; }} className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition duration-500" /><div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/25 to-transparent" /><div className="absolute bottom-0 p-3 w-full"><h4 className="font-black text-xs md:text-sm truncate">{product.title}</h4><div className="flex items-center justify-between gap-2 mt-1"><p className="text-cyan-300 font-bold text-xs md:text-sm">{product.useSizePricing ? "Desde " : ""}€ {getDisplayPrice(product)}</p><span className="text-[9px] px-2 py-0.5 rounded-full bg-emerald-400/10 text-emerald-300 border border-emerald-300/20">{product.status}</span></div></div><div className="absolute top-2 right-2 flex gap-1 opacity-100 md:opacity-0 group-hover:opacity-100 transition"><button onClick={() => onEdit?.(product)} className="px-2 py-1.5 rounded-lg bg-black/60 border border-white/10 text-white text-[10px]">Editar</button><button aria-label={`Eliminar ${product.title}`} onClick={() => onDelete(product.id)} className="px-2 py-1.5 rounded-lg bg-red-500/20 text-red-300"><Icon name="trash" className="h-3.5 w-3.5" /></button></div></div>;
+  return <div className="relative rounded-2xl overflow-hidden border border-white/10 group aspect-square bg-black/30"><img src={product.image} alt={product.title} onError={(event) => { event.currentTarget.src = fallbackImage; }} className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition duration-500" /><div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/25 to-transparent" /><div className="absolute bottom-0 p-3 w-full">{product.category && <p className="mb-1 w-fit rounded-full border border-cyan-300/20 bg-cyan-400/10 px-2 py-0.5 text-[9px] font-black text-cyan-200 truncate max-w-full">{product.category}{product.categoryExtra ? ` · ${product.categoryExtra}` : ""}</p>}<h4 className="font-black text-xs md:text-sm truncate">{product.title}</h4><div className="flex items-center justify-between gap-2 mt-1"><p className="text-cyan-300 font-bold text-xs md:text-sm">{product.useSizePricing ? "Desde " : ""}€ {getDisplayPrice(product)}</p><span className="text-[9px] px-2 py-0.5 rounded-full bg-emerald-400/10 text-emerald-300 border border-emerald-300/20">{product.status}</span></div></div><div className="absolute top-2 right-2 flex gap-1 opacity-100 md:opacity-0 group-hover:opacity-100 transition"><button onClick={() => onEdit?.(product)} className="px-2 py-1.5 rounded-lg bg-black/60 border border-white/10 text-white text-[10px]">Editar</button><button aria-label={`Eliminar ${product.title}`} onClick={() => onDelete(product.id)} className="px-2 py-1.5 rounded-lg bg-red-500/20 text-red-300"><Icon name="trash" className="h-3.5 w-3.5" /></button></div></div>;
 }
 
 function OrderCard({ order, isSelected, onClick }) {
